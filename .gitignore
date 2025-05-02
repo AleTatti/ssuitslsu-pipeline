@@ -1,0 +1,8 @@
+# ignore raw data and results
+/data/
+/results/
+
+# ignore logs and macOS metadata
+*.log
+*.DS_Store
+
