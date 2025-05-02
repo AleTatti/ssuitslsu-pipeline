@@ -1,0 +1,9 @@
+# envs/taxo.yaml
+name: ssuitslsu-taxo
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - python>=3.8
+  - pandas
+  - openpyxl

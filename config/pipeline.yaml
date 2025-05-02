@@ -1,0 +1,26 @@
+# config/pipeline.yaml
+
+# 1. Where your raw sequencing reads live
+reads_dir: "/Users/utente/Desktop/PhD/Tuber/raw_reads"
+
+# 2. Taxonomy spreadsheet (Excel .xlsx or .csv BOLD format)
+taxonomy_file: "'/Users/utente/Downloads/bold (2).xlsx'"
+
+# 2.1 Taxonomy sheet of the spreadsheet
+taxonomy_sheet:   "Taxonomy"
+
+# 3. Reference database (FASTA of SSU, ITS, LSU sequences)
+ref_fasta: ""
+
+# 4. Path to Trimmomatic adapter file
+trimmomatic_adapters: "/Users/utente/miniforge3/envs/ssuitslsu-trimmomatic/share/trimmomatic/adapters/TruSeq2-PE.fa"
+
+# 4.1 if true, will *NOT* run Trimmomatic but use existing *_trimmed_1P/2P.fastq.gz
+skip_trimming:   false
+
+# 5. Computational resources
+threads: 8       # e.g. number of CPU cores to use
+mem_gb: 16       # e.g. total RAM in GB
+
+# 6. Where to put all output
+outdir: "results"
