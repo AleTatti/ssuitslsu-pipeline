@@ -270,13 +270,20 @@ for fp in "$READS_DIR"/*; do
 
         if [[ "$need_trim" == "true" ]]; then
           conda activate ssuitslsu-trimmomatic
+          # resolve adapter path
+          if [[ "$TRIMMOMATIC_ADAPTERS" == "auto" || -z "$TRIMMOMATIC_ADAPTERS" ]]; then
+            # this is where the adapters live in the activated env
+            ADAPTERS="$CONDA_PREFIX/share/trimmomatic/adapters/TruSeq2-PE.fa"
+          else
+            ADAPTERS="$TRIMMOMATIC_ADAPTERS"
+          fi
           echo "[`date`] Trimming reads for $sample"
           trimmomatic PE \
             -threads "$THREADS" -phred33 \
             "$R1" "$R2" \
             "$out_fw" "$un_fw" \
             "$out_rev" "$un_rev" \
-            ILLUMINACLIP:"${TRIM_ADAPTERS}:2:30:10" \
+            ILLUMINACLIP:"$ADAPTERS:2:30:10" \
             SLIDINGWINDOW:4:15 MINLEN:70 HEADCROP:10
         else
           echo "[`date`] Skipping trimming (outputs exist)"
