@@ -1,5 +1,7 @@
 # ignore results
 /results/
+# ignore auto-downloaded reference
+data/
 
 # ignore logs and macOS metadata
 *.log
