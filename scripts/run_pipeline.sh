@@ -60,7 +60,7 @@ for var in READS_DIR TAXO_XLSX REF_FASTA TRIM_ADAPTERS; do
   printf -v "$var" '%s' "$val"
 done
 
- ─── Download & build filtered reference if missing ─────────────────────────
+# ─── Download & build filtered reference if missing ─────────────────────────
 DATA_DIR="$(dirname "$0")/../data"
 mkdir -p "$DATA_DIR"
 
