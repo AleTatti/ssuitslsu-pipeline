@@ -1,0 +1,2 @@
+data/*.fasta filter=lfs diff=lfs merge=lfs -text
+data/General_EUK_longread_v1.9.4_nomito_Fungi.fasta filter=lfs diff=lfs merge=lfs -text
