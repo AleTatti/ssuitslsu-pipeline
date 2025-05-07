@@ -1,0 +1,26 @@
+# config/pipeline.yaml
+
+# 1. Where your raw sequencing reads live
+reads_dir: "/home/alessia.tatti/macrofungi/tuber/raw_reads"
+
+# 2. Taxonomy spreadsheet (Excel .xlsx or .csv BOLD format)
+taxonomy_file: "/home/alessia.tatti/macrofungi/bold_taxonomy.xlsx'"
+
+# 2.1 Taxonomy sheet of the spreadsheet
+taxonomy_sheet:   "Taxonomy"
+
+# 3. Reference database (FASTA of SSU, ITS, LSU sequences) # ref_fasta is auto-downloaded if unset
+ref_fasta: "" 
+
+# 4. Path to Trimmomatic adapter file
+trimmomatic_adapters: auto # The pipeline will automatically locate the adapters in the ssuitslsu-trimmomatic Conda env
+
+# 4.1 if true, will *NOT* run Trimmomatic but use existing *_trimmed_1P/2P.fastq.gz
+skip_trimming:   false
+
+# 5. Computational resources
+threads: 20       # e.g. number of CPU cores to use
+mem_gb: 24       # e.g. total RAM in GB
+
+# 6. Where to put all output
+outdir: "results"

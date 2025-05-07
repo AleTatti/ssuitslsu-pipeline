@@ -1,0 +1,7 @@
+name: ssuitslsu-itsx
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - itsx
+  - seqkit

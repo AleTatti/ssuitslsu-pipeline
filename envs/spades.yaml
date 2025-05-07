@@ -1,0 +1,7 @@
+# envs/spades.yaml
+name: ssuitslsu-spades
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - spades

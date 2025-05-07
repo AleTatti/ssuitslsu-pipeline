@@ -1,0 +1,8 @@
+# envs/trimmomatic.yaml
+name: ssuitslsu-trimmomatic
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - trimmomatic
+  - openjdk          # for Java runtime
