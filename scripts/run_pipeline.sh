@@ -50,10 +50,12 @@ REF_FASTA=$(shyaml get-value ref_fasta           < "$CONFIG")
 THREADS=$(shyaml get-value threads               < "$CONFIG")
 MEM_GB=$(shyaml get-value mem_gb                 < "$CONFIG")
 OUTDIR=$(shyaml get-value outdir                 < "$CONFIG")
-TRIM_ADAPTERS=$(shyaml get-value trimmomatic_adapters < "$CONFIG")
+TRIMMOMATIC_ADAPTERS=$(shyaml get-value trimmomatic_adapters < "$CONFIG")
+# ensure it's never unset or empty
+TRIMMOMATIC_ADAPTERS=${TRIMMOMATIC_ADAPTERS:-auto}
 
 # Strip stray quotes (so paths with spaces work)
-for var in READS_DIR TAXO_XLSX REF_FASTA TRIM_ADAPTERS; do
+for var in READS_DIR TAXO_XLSX REF_FASTA TRIMMOMATIC_ADAPTERS; do
   val="${!var}"
   val="${val#\"}"; val="${val%\"}"
   val="${val#\'}"; val="${val%\'}"
@@ -110,13 +112,18 @@ die(){ echo "ERROR: $*" >&2; exit 1; }
 [[ -d "$READS_DIR"     ]] || die "reads_dir not found: $READS_DIR"
 [[ -f "$TAXO_XLSX"     ]] || die "taxonomy_file not found: $TAXO_XLSX"
 [[ -f "$REF_FASTA"     ]] || die "ref_fasta not found: $REF_FASTA"
-[[ -f "$TRIM_ADAPTERS" ]] || die "trimmomatic_adapters not found: $TRIM_ADAPTERS"
+if [[ -n "$TRIMMOMATIC_ADAPTERS" && "$TRIMMOMATIC_ADAPTERS" != "auto" ]]; then
+  [[ -f "$TRIMMOMATIC_ADAPTERS" ]] || {
+    echo "ERROR: trimmomatic_adapters not found: $TRIMMOMATIC_ADAPTERS" >&2
+    exit 1
+  }
+fi
 
 echo "Running with:"
 echo "  skip_trimming = $SKIP_TRIM"
 echo "  threads       = $THREADS"
 echo "  mem_gb        = $MEM_GB"
-echo "  adapters      = $TRIM_ADAPTERS"
+echo "  adapters      = $TRIMMOMATIC_ADAPTERS"
 echo
 
 mkdir -p "$OUTDIR"
