@@ -1,7 +1,0 @@
-# envs/utils.yaml
-name: ssuitslsu-utils
-channels:
-  - conda-forge
-dependencies:
-  - shyaml
-  - yq            # (optional)

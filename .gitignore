@@ -1,5 +1,4 @@
-# ignore raw data and results
-/data/
+# ignore results
 /results/
 
 # ignore logs and macOS metadata

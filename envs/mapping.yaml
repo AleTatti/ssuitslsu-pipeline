@@ -1,8 +1,0 @@
-# envs/mapping.yaml
-name: ssuitslsu-mapping
-channels:
-  - bioconda
-  - conda-forge
-dependencies:
-  - bwa-mem2
-  - samtools
