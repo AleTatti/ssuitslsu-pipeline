@@ -12,6 +12,7 @@ Options:
   -m, --max-memory MB     Override memory (GB) for SPAdes
   -t, --threads N         Override number of threads for all steps
   -h, --help              Show this help message and exit
+  --assembler [spades|megahit]
 EOF
 }
 # ──────────────────────────────────────────────────────────────────────────────
@@ -28,6 +29,7 @@ while [[ $# -gt 0 ]]; do
     -m|--max-memory)   MEM_CLI="$2"; shift 2 ;;
     -t|--threads)      THREADS_CLI="$2"; shift 2 ;;
     -h|--help)         usage; exit 0 ;;
+    --assembler) ASSEMBLER="$2"; shift 2 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
@@ -106,6 +108,14 @@ else
 fi
 [[ -n "$MEM_CLI"     ]] && MEM_GB="$MEM_CLI"
 [[ -n "$THREADS_CLI" ]] && THREADS="$THREADS_CLI"
+
+# ─── Assembler default & validation ────────────────────────────────────────
+ASSEMBLER=${ASSEMBLER:-$(shyaml get-value assembler < "$CONFIG")}
+
+if [[ "$ASSEMBLER" != "spades" && "$ASSEMBLER" != "megahit" ]]; then
+  echo "ERROR: --assembler must be 'spades' or 'megahit' (you passed '$ASSEMBLER')" >&2
+  exit 1
+fi
 
 # 3) Validate config
 die(){ echo "ERROR: $*" >&2; exit 1; }
@@ -210,7 +220,7 @@ for fp in "$READS_DIR"/*; do
       start_ts=$(date +"%Y-%m-%d %H:%M:%S")
       echo "[`date`] ===> Processing $sample"; t0=$(date +%s)
 
-      # Reference selection
+      # ─── Reference Selection ────────────────────────────────────────────────
       taxo_line=$(grep -m1 "^${sample}," "$TAX_CSV" || true)
       [[ -z "$taxo_line" ]] && echo "!! No taxonomy for $sample; skipping" >&2 && continue 2
       IFS=, read -r _ phylum cls ord fam subfam tribe gen spp subspp <<<"$taxo_line"
@@ -250,7 +260,7 @@ for fp in "$READS_DIR"/*; do
       done
       [[ -z "$SAMPLE_REF" ]] && echo "!! No reference found; skipping" >&2 && continue 2
 
-      # Trimming
+      # ─── Trimming ────────────────────────────────────────────────
       t_trim_start=$(date +%s)
 
       out_fw="$SAMPLE_DIR/${sample}_trimmed_1P.fastq.gz"
@@ -301,7 +311,7 @@ for fp in "$READS_DIR"/*; do
       R2="$out_rev"
 
 
-      # Mapping
+      # ─── Mapping ────────────────────────────────────────────────
       t_map_start=$(date +%s)
       BAM="$SAMPLE_DIR/${sample}.sorted.bam"
       if [[ ! -f "$BAM" ]]; then
@@ -329,70 +339,284 @@ for fp in "$READS_DIR"/*; do
       fi
       t_map_end=$(date +%s)
 
-      # Assembly
+      # ─── Assembly ────────────────────────────────────────────────────────
       t_asm_start=$(date +%s)
-      SP_DIR="$SAMPLE_DIR/spades"
-      CONTIG="$SP_DIR/contigs.fasta"
-      if [[ ! -f "$CONTIG" ]]; then
-        conda activate ssuitslsu-spades
-        echo "[`date`] Assembling"
-        mkdir -p "$SP_DIR"
-        if [[ -f "$U0" ]]; then
-          if ! zgrep -q '^@' "$U0"; then
+      ASM_DIR="$SAMPLE_DIR/assembly"
+      mkdir -p "$ASM_DIR"
+
+      if [[ "$ASSEMBLER" == "spades" ]]; then
+        SP_DIR="$ASM_DIR/spades"
+        CONTIG="$SP_DIR/contigs.fasta"
+
+        if [[ ! -f "$CONTIG" ]]; then
+          conda activate ssuitslsu-spades
+          echo "[`date`] Assembling with SPAdes"
+          mkdir -p "$SP_DIR"
+
+          # — remove empty singletons just like before
+          if [[ -f "$U0" ]] && ! zgrep -q '^@' "$U0"; then
             echo "→ Removing empty singleton"
             rm -f "$U0"
           fi
+
+          # run SPAdes, capturing its log
+          cmd=(spades.py --only-assembler \
+            -1 "$P1" -2 "$P2" \
+            -t "$THREADS" -m "$MEM_GB" \
+            -o "$SP_DIR")
+          [[ -f "$U0" ]] && cmd+=( -s "$U0" )
+          "${cmd[@]}" 2>&1 | tee "$SP_DIR/spades.log"
+        else
+          echo "[`date`] Skipping SPAdes assembly (exists)"
         fi
-        cmd=(spades.py --only-assembler -1 "$P1" -2 "$P2" -t "$THREADS" -m "$MEM_GB" -o "$SP_DIR")
-        [[ -f "$U0" ]] && cmd+=( -s "$U0" )
-        "${cmd[@]}" 2>&1 | tee "$SP_DIR/spades.log"
+
+      elif [[ "$ASSEMBLER" == "megahit" ]]; then
+        MH_DIR="$ASM_DIR/megahit"
+        CONTIG="$MH_DIR/final.contigs.fa"
+
+        if [[ ! -f "$CONTIG" ]]; then
+          conda activate ssuitslsu-megahit
+          echo "[`date`] Assembling with MEGAHIT"
+
+          # — remove empty singleton just like before
+          if [[ -f "$U0" ]] && ! zgrep -q '^@' "$U0"; then
+            echo "→ Removing empty singleton"
+            rm -f "$U0"
+          fi
+
+          # ─── Clear any old output so Megahit never complains ──────────────
+          rm -rf "$MH_DIR"
+
+          # build and run Megahit (it will generate its own reads.lib)
+          cmd=(megahit \
+            -1 "$P1" \
+            -2 "$P2" \
+            --out-dir "$MH_DIR" \
+            --num-cpu-threads "$THREADS" \
+            --min-contig-len 1000 \
+            --memory "$MEM_GB" \
+            --verbose \
+            --keep-tmp-files
+          )
+          # include singletons if present
+          [[ -f "$U0" ]] && cmd+=( -r "$U0" )
+
+          # run and capture the log
+          "${cmd[@]}" 2>&1 | tee "$ASM_DIR/megahit.log"
+        else
+          echo "[`date`] Skipping MEGAHIT assembly (exists)"
+        fi
+
       else
-        echo "[`date`] Skipping assembly (exists)"
+        die "Unknown assembler: $ASSEMBLER (must be spades or megahit)"
       fi
+
       t_asm_end=$(date +%s)
 
-      # ITS extraction
+
+
+      # ─── Assembly stats (contigs ≥1 kb) ────────────────────────────────────────
+      CONTIG_DIR=$(dirname "$CONTIG")
+      STATS_MINLEN=1000
+      FILTERED_CONTIGS="${CONTIG_DIR}/contigs.${STATS_MINLEN}bp.fasta"
+      ASSEMBLY_STATS="${CONTIG_DIR}/assembly_stats.${STATS_MINLEN}bp.txt"
+
+      echo "[`date`] Computing assembly stats (contigs ≥ ${STATS_MINLEN} bp)"
+      # extract only contigs ≥1 kb
+      conda activate ssuitslsu-itsx
+      seqkit seq -m${STATS_MINLEN} "$CONTIG" -o "$FILTERED_CONTIGS"
+
+      # get basic stats: num_seqs, sum_len, min_len, avg_len, max_len
+      read NUM_SEQS SUM_LEN MIN_LEN AVG_LEN MAX_LEN < <(
+        seqkit stats -a "$FILTERED_CONTIGS" --no-header \
+          | awk '{print $4, $5, $6, $7, $8}'
+      )
+
+      # get N50 and L50
+      read _ _ _ _ _ N50 L50 _ < <(
+        seqkit stats -a "$FILTERED_CONTIGS" --no-header \
+          | awk '{print $11, $12}'
+      )
+
+      # compute weighted GC% across all ≥1 kb contigs
+      GC=$(seqkit fx2tab -g "$FILTERED_CONTIGS" \
+           | tail -n+2 \
+           | awk '{
+               len=$2; gcpct=$3/100;
+               total_len+=len; total_gc+=len*gcpct
+             }
+             END { printf("%.2f", total_gc/total_len*100) }'
+      )
+
+      {
+        echo "CONTIGS-${STATS_MINLEN}BP:    $NUM_SEQS"
+        echo "ASSEMBLY_LEN-${STATS_MINLEN}BP:    $SUM_LEN"
+        echo "LARGEST_CONTIG:   $MAX_LEN"
+        echo "N50-${STATS_MINLEN}BP:           $N50"
+        echo "L50-${STATS_MINLEN}BP:           $L50"
+        echo "GC-${STATS_MINLEN}BP:            ${GC}%"
+      } | tee "$ASSEMBLY_STATS"
+
+      echo
+
+      # ─── ITS extraction ─────────────────────────────────────────────────────────
       t_its_start=$(date +%s)
       ITSX_DIR="$SAMPLE_DIR/itsx"; mkdir -p "$ITSX_DIR"
       FULL_OUT="$ITSX_DIR/${sample}.full.fasta"
 
       if [[ -s "$FULL_OUT" ]]; then
-        echo "[`date`] Skipping ITSx (already have full region: $FULL_OUT)"
+        echo "[`date`] Skipping ITSx (found full region: $FULL_OUT)"
       else
-        echo "[`date`] Running ITSx for $sample"
+        echo "[`date`] Preparing input for ITSx on $sample"
         conda activate ssuitslsu-itsx
-        seqkit seq -g -m200 -M100000 "$CONTIG" -o "$ITSX_DIR/filtered.fasta"
-        ITSx -i "$ITSX_DIR/filtered.fasta" \
-             -o "$ITSX_DIR/${sample}" \
-             --preserve T \
-             --only_full T \
-             --save_regions all \
-             -t F \
-             --region ITS \
-             --cpu "$THREADS"
+
+        # 1) chunk any contig >100 kb into ≤100 kb pieces
+        CHUNKS="$ITSX_DIR/contigs.chunks.fasta"
+        awk -v L=100000 '
+          BEGIN { RS=">"; ORS="" }
+          NR>1 {
+            # separate header from sequence
+            header = $1
+            seq = ""; 
+            # join all the rest of the lines into one long seq
+            for(i=2; i<=NF; i++) seq = seq $i
+            len = length(seq)
+
+            if (len > L) {
+              # how many pieces?
+              k = int((len - 1)/L) + 1
+              for (i = 0; i < k; i++) {
+                start = i*L + 1
+                printf(">%s_%03d\n%s\n", header, i+1, substr(seq, start, L))
+              }
+            } else {
+              # just print the contig unchanged
+              printf(">%s\n%s\n", header, seq)
+            }
+          }
+        ' "$CONTIG" > "$CHUNKS"
+
+        # 2) filter out anything <200 bp
+        FILTERED="$ITSX_DIR/filtered.fasta"
+        seqkit seq -m200 "$CHUNKS" -o "$FILTERED"
+
+        # 3) if no fragments ≥200 bp, skip ITSx; otherwise run it
+        if [[ ! -s "$FILTERED" ]]; then
+          echo "[`date`] No fragments ≥200 bp after chunking; skipping ITSx for $sample"
+          touch "$ITSX_DIR/${sample}_no_detections.txt"
+        else
+          echo "[`date`] Running ITSx for $sample"
+          ITSx -i "$FILTERED" \
+               -o "$ITSX_DIR/${sample}" \
+               --preserve T \
+               --only_full T \
+               --save_regions all \
+               -t F \
+               --region all \
+               --anchor HMM \
+               --cpu "$THREADS"
+        fi
       fi
+      #               
       t_its_end=$(date +%s)
 
-      # Timing & report
+
+      # ─── Phylogenetic analysis ────────────────────────────────────────────────
+      PHYLO_DIR="$SAMPLE_DIR/phylogeny"
+      mkdir -p "$PHYLO_DIR"
+
+      # 0) pick the first ITSx output that exists
+      ITS_SRC=""
+      for region in full ITS1 ITS2; do
+        candidate="$ITSX_DIR/${sample}.${region}.fasta"
+        if [[ -s "$candidate" ]]; then
+          printf "[%s] Using ITSx %s for phylogeny\n" "$(date)" "$region"
+          ITS_SRC="$candidate"
+          break
+        fi
+      done
+
+      if [[ -z "$ITS_SRC" ]]; then
+        printf "[%s] No ITSx output (full, ITS1 or ITS2); skipping phylogeny for %s\n\n" \
+               "$(date)" "$sample"
+      else
+        # extract the original contig name
+        orig_node=$(grep -m1 '^>' "$ITS_SRC" | sed 's/^>//;s/ .*//')
+        orig_contig_fasta="$PHYLO_DIR/${sample}_${orig_node}.fasta"
+        awk -v node="$orig_node" '
+          BEGIN { RS=">"; ORS="" }
+          $1 == node { print ">" $0 }
+        ' "$CONTIG" > "$orig_contig_fasta"
+
+        # 1) Build genus‐level FASTA
+        GEN_FASTA="$PHYLO_DIR/${gen}.fasta"
+        printf "[%s] Building genus FASTA: %s\n" "$(date)" "$GEN_FASTA"
+        awk -v tag="g__${gen}" '
+          BEGIN { RS=">"; ORS="" }
+          $0 ~ ("(^|;)" tag "(;|$)") { print ">" $0 }
+        ' "$REF_FASTA" > "$GEN_FASTA"
+        # append our contig with sample tag
+        seqkit replace \
+          -p '^>(.+)' -r ">${sample}_\1" \
+          "$orig_contig_fasta" >> "$GEN_FASTA"
+
+        # 2) MAFFT alignment
+        PHYLO_ALN="$PHYLO_DIR/${gen}.aln"
+        if [[ -s "$PHYLO_ALN" ]]; then
+          printf "[%s] Skipping MAFFT (alignment exists): %s\n\n" "$(date)" "$PHYLO_ALN"
+        else
+          t_align_start=$(date +%s)
+          conda activate ssuitslsu-mafft
+          printf "[%s] Running MAFFT → %s\n" "$(date)" "$PHYLO_ALN"
+          mafft --auto "$GEN_FASTA" > "$PHYLO_ALN"
+          t_align_end=$(date +%s)
+          printf "\n"
+        fi
+
+        # 3) IQ-TREE ML inference
+        PHYLO_PREFIX="$PHYLO_DIR/${gen}"
+        TREEFILE="${PHYLO_PREFIX}.treefile"
+        if [[ -s "$TREEFILE" ]]; then
+          printf "[%s] Skipping IQ-TREE (tree exists): %s\n\n" "$(date)" "$TREEFILE"
+        else
+          t_phylo_start=$(date +%s)
+          conda activate ssuitslsu-iqtree
+          printf "[%s] Running IQ-TREE → prefix %s\n" "$(date)" "$PHYLO_PREFIX"
+          iqtree \
+            -s "$PHYLO_ALN" \
+            -m MFP \
+            -nt AUTO \
+            -bb 1000 \
+            -pre "$PHYLO_PREFIX"
+          t_phylo_end=$(date +%s)
+          printf "\n"
+        fi
+      fi
+
+
+      # ─── Timing & report ───────────────────────────────────────────────
       t1=$(date +%s)
       end_ts=$(date +"%Y-%m-%d %H:%M:%S")
       elapsed=$((t1 - t0))
+
       trim_dur=$((t_trim_end - t_trim_start))
-      map_dur=$((t_map_end - t_map_start))
-      asm_dur=$((t_asm_end - t_asm_start))
-      its_dur=$((t_its_end - t_its_start))
+      map_dur=$((t_map_end  - t_map_start))
+      asm_dur=$((t_asm_end  - t_asm_start))
+      its_dur=$((t_its_end  - t_its_start))
+      align_dur=$((t_align_end  - t_align_start))
+      phylo_dur=$((t_phylo_end  - t_phylo_start))
 
       printf "→ Sample: %s\n  Started: %s\n  Finished: %s\n  Elapsed: %02dh:%02dm:%02ds\n\n" \
-             "$sample" "$start_ts" "$end_ts" \
-             $((elapsed/3600)) $(((elapsed%3600)/60)) $((elapsed%60))
-      printf "    Trimming: %02dm%02ds\n" \
-         $((trim_dur/60)) $((trim_dur%60))
-      printf "    Mapping:  %02dm%02ds\n" \
-             $((map_dur/60)) $((map_dur%60))
-      printf "    Assembly: %02dm%02ds\n" \
-             $((asm_dur/60)) $((asm_dur%60))
-      printf "    ITSx:     %02dm%02ds\n\n" \
-             $((its_dur/60)) $((its_dur%60))
+        "$sample" "$start_ts" "$end_ts" \
+        $((elapsed/3600)) $(((elapsed%3600)/60)) $((elapsed%60))
+
+      printf "    Trimming:   %02dm%02ds\n" $((trim_dur/60)) $((trim_dur%60))
+      printf "    Mapping:    %02dm%02ds\n" $((map_dur/60)) $((map_dur%60))
+      printf "    Assembly:   %02dm%02ds\n" $((asm_dur/60)) $((asm_dur%60))
+      printf "    ITSx:       %02dm%02ds\n" $((its_dur/60)) $((its_dur%60))
+      printf "    Alignment:  %02dm%02ds\n" $((align_dur/60)) $((align_dur%60))
+      printf "    Phylogeny:  %02dm%02ds\n\n" $((phylo_dur/60)) $((phylo_dur%60))
+
 
       break
     fi

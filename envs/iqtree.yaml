@@ -1,0 +1,6 @@
+name: ssuitslsu-iqtree
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - iqtree

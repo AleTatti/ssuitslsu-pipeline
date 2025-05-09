@@ -1,0 +1,6 @@
+name: ssuitslsu-mafft
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - mafft

@@ -1,0 +1,7 @@
+# envs/megahit.yaml
+name: ssuitslsu-megahit
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - megahit

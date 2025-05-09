@@ -1,7 +1,7 @@
 # ssuitslsu-pipeline
 
-**SSU + ITS + LSU genome‐skimming pipeline**
-Extracts ribosomal small subunit (SSU), internal transcribed spacer (ITS), and large subunit (LSU) regions from fungal genome‐skimming data, with automated trimming, mapping, assembly, and ITS annotation.
+**SSU + ITS + LSU extraction**
+Extracts ribosomal small subunit (SSU), internal transcribed spacer (ITS), and large subunit (LSU) regions from fungal genome‐skimming data, assembles contigs, annotates ITS regions, and builds per‐genus alignments and phylogenetic trees.
 
 ---
 
@@ -31,7 +31,10 @@ Extracts ribosomal small subunit (SSU), internal transcribed spacer (ITS), and l
    conda env create -f envs/trimmomatic.yaml
    conda env create -f envs/mapping.yaml
    conda env create -f envs/spades.yaml
+   conda env create -f envs/megahit.yaml
    conda env create -f envs/itsx.yaml
+   conda env create -f envs/mafft.yaml
+   conda env create -f envs/iqtree.yaml
    ```
 
 ---
@@ -42,19 +45,20 @@ Edit `config/pipeline.yaml` to point at your data and tweak parameters:
 
 ```yaml
 reads_dir: "/path/to/raw_reads"
-taxonomy_file: "/path/to/your_taxonomy.xlsx" # BOLD format
+taxonomy_file: "/path/to/your_taxonomy.xlsx"  # BOLD format
 taxonomy_sheet: "Taxonomy"
 # ref_fasta is auto-downloaded if unset
 # ref_fasta: "/path/to/custom_reference.fasta"
-trimmomatic_adapters: auto # The pipeline will automatically locate the adapters in the ssuitslsu-trimmomatic Conda env
-skip_trimming: false
+trimmomatic_adapters: auto  # auto‐located in the trimmomatic env
+tskip_trimming: false # true to use existing *_trimmed FASTQs
+assembler: spades           # or "megahit"
 threads: 8
 mem_gb: 16
 outdir: "results"
 ```
 
 * **skip\_trimming**: set to `true` to use existing `*_trimmed` FASTQs.
-* **threads / mem\_gb**: controls CPU and RAM for mapping and assembly.
+* **threads / mem\_gb**: controls CPU and RAM for mapping, assembly, alignment, and tree building.
 
 ---
 
@@ -72,11 +76,11 @@ This will automatically:
 2. Convert your taxonomy spreadsheet (BOLD format) into a CSV.
 3. Trim reads with Trimmomatic (or skip if already trimmed).
 4. Map to the best‐matching reference and extract mapped reads.
-5. Assemble contigs with SPAdes.
-6. Extract ITS regions with ITSx.
-7. Provide per‐sample timing breakdown.
-
-Results will be stored under `results/<sample>/`.
+5. Assemble contigs with SPAdes or Megahit.
+6. Computes stats for contigs ≥ 1 kb
+7. Extract ITS regions with ITSx.
+8. Build per‐genus 45S FASTA sets, align with MAFFT, and infer ML trees with IQ-TREE.
+9. Provide per‐sample and per‐step timing breakdown.
 
 ---
 
@@ -90,14 +94,20 @@ results/
     ├── <sample>.sorted.bam
     ├── <sample>.mapped_1.fastq.gz
     ├── <sample>.mapped_2.fastq.gz
-    ├── spades/
-    │   ├── contigs.fasta
-    │   └── scaffolds.fasta
-    └── itsx/
-        ├── <sample>.ITS1.fasta
-        ├── <sample>.5_8S.fasta
-        ├── <sample>.ITS2.fasta
-        └── <sample>.full.fasta
+    ├── assembly/
+    │   ├── spades/      # contigs.fasta, scaffolds.fasta, spades.log
+    │   ├── megahit/     # final.contigs.fa, megahit.log
+    │   └── assembly_stats.1000bp.txt
+    ├── itsx/
+    │   ├── <sample>.ITS1.fasta
+    │   ├── <sample>.5_8S.fasta
+    │   ├── <sample>.ITS2.fasta
+    │   └── <sample>.full.fasta
+    └── phylogeny/
+        ├── <genus>.fasta       # FASTA of reference + sample contig
+        ├── <genus>.aln         # MAFFT alignment
+        ├── <genus>.treefile    # IQ-TREE tree
+        └── <genus>.log         # IQ-TREE run log
 ```
 
 ---
