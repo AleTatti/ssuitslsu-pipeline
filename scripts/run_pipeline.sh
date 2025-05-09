@@ -414,7 +414,7 @@ for fp in "$READS_DIR"/*; do
       t_asm_end=$(date +%s)
 
 
-      # ─── Assembly stats (contigs ≥1 kb) ────────────────────────────────────
+            # ─── Assembly stats (contigs ≥1 kb) ────────────────────────────────────
       CONTIG_DIR=$(dirname "$CONTIG")
       STATS_MINLEN=1000
       FILTERED_CONTIGS="${CONTIG_DIR}/contigs.${STATS_MINLEN}bp.fasta"
@@ -426,45 +426,24 @@ for fp in "$READS_DIR"/*; do
         echo "[$(date)] Computing assembly stats (contigs ≥ ${STATS_MINLEN} bp)"
         conda activate ssuitslsu-itsx
 
-        # extract only contigs ≥1 kb
+        # 1) extract only contigs ≥1 kb
         seqkit seq -m${STATS_MINLEN} "$CONTIG" -o "$FILTERED_CONTIGS"
 
-        # if nothing survives, bail out
+        # 2) if none survive, skip
         if [[ ! -s "$FILTERED_CONTIGS" ]]; then
           echo "[$(date)] No contigs ≥${STATS_MINLEN} bp; skipping stats."
         else
-          # grab the one data line from seqkit stats
-          stats_data=$(seqkit stats -a -N 50 -T "$FILTERED_CONTIGS" | tail -n1)
+          # 3) grab the one data line from seqkit stats (tabular, all stats)
+          stats_data=$(seqkit stats -a -T "$FILTERED_CONTIGS" | tail -n1)
 
-          NUM_SEQS=$( echo "$stats_data" | cut -f4 )
-          SUM_LEN=$(  echo "$stats_data" | cut -f5 )
-          MIN_LEN=$(  echo "$stats_data" | cut -f6 )
-          AVG_LEN=$(  echo "$stats_data" | cut -f7 )
-          MAX_LEN=$(  echo "$stats_data" | cut -f8 )
-          N50=$(      echo "$stats_data" | cut -f9 )
-          L50=$(      echo "$stats_data" | cut -f10 )
-
-          # drop decimals
-          N50=${N50%.*}
-          L50=${L50%.*}
-
-          # compute weighted GC% across all filtered contigs
-          GC=$(awk '
-            /^>/ { next }
-            {
-              seq = $0
-              total_len += length(seq)
-              # count G/C
-              gc += gsub(/[GgCc]/, "", seq)
-            }
-            END {
-              if (total_len > 0) {
-                printf("%.2f", gc/total_len*100)
-              } else {
-                printf("0.00")
-              }
-            }
-          ' "$FILTERED_CONTIGS")
+          NUM_SEQS=$(echo "$stats_data" | cut -f4)
+          SUM_LEN=$( echo "$stats_data" | cut -f5)
+          MIN_LEN=$( echo "$stats_data" | cut -f6)
+          AVG_LEN=$( echo "$stats_data" | cut -f7)
+          MAX_LEN=$( echo "$stats_data" | cut -f8)
+          N50=$(     echo "$stats_data" | cut -f13)
+          L50=$(     echo "$stats_data" | cut -f14)
+          GC_PCT=$(  echo "$stats_data" | cut -f18 | tr -d '%')
 
           {
             echo "CONTIGS-${STATS_MINLEN}BP:    $NUM_SEQS"
@@ -472,12 +451,13 @@ for fp in "$READS_DIR"/*; do
             echo "LARGEST_CONTIG:   $MAX_LEN"
             echo "N50-${STATS_MINLEN}BP:           $N50"
             echo "L50-${STATS_MINLEN}BP:           $L50"
-            echo "GC-${STATS_MINLEN}BP:            ${GC}%"
+            echo "GC-${STATS_MINLEN}BP:            ${GC_PCT}%"
           } | tee "$ASSEMBLY_STATS"
         fi
       fi
 
       echo
+
 
 
 
