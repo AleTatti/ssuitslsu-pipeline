@@ -384,10 +384,10 @@ for fp in "$READS_DIR"/*; do
             rm -f "$U0"
           fi
 
-          # ─── Clear any old output so Megahit never complains ──────────────
+          # ─── Clear any old output
           rm -rf "$MH_DIR"
 
-          # build and run Megahit (it will generate its own reads.lib)
+          # build and run Megahit 
           cmd=(megahit \
             -1 "$P1" \
             -2 "$P2" \
@@ -415,49 +415,70 @@ for fp in "$READS_DIR"/*; do
 
 
 
-      # ─── Assembly stats (contigs ≥1 kb) ────────────────────────────────────────
+      # ─── Assembly stats (contigs ≥1 kb) ────────────────────────────────────
       CONTIG_DIR=$(dirname "$CONTIG")
       STATS_MINLEN=1000
       FILTERED_CONTIGS="${CONTIG_DIR}/contigs.${STATS_MINLEN}bp.fasta"
       ASSEMBLY_STATS="${CONTIG_DIR}/assembly_stats.${STATS_MINLEN}bp.txt"
 
-      echo "[`date`] Computing assembly stats (contigs ≥ ${STATS_MINLEN} bp)"
-      # extract only contigs ≥1 kb
-      conda activate ssuitslsu-itsx
-      seqkit seq -m${STATS_MINLEN} "$CONTIG" -o "$FILTERED_CONTIGS"
+      if [[ -s "$ASSEMBLY_STATS" ]]; then
+        echo "[`date`] Skipping assembly stats (found): $ASSEMBLY_STATS"
+      else
+        echo "[`date`] Computing assembly stats (contigs ≥ ${STATS_MINLEN} bp)"
+        conda activate ssuitslsu-itsx
 
-      # get basic stats: num_seqs, sum_len, min_len, avg_len, max_len
-      read NUM_SEQS SUM_LEN MIN_LEN AVG_LEN MAX_LEN < <(
-        seqkit stats -a "$FILTERED_CONTIGS" --no-header \
-          | awk '{print $4, $5, $6, $7, $8}'
-      )
+        # extract only contigs ≥1 kb
+        seqkit seq -m ${STATS_MINLEN} "$CONTIG" -o "$FILTERED_CONTIGS"
 
-      # get N50 and L50
-      read _ _ _ _ _ N50 L50 _ < <(
-        seqkit stats -a "$FILTERED_CONTIGS" --no-header \
-          | awk '{print $11, $12}'
-      )
+        # if nothing survives, bail out
+        if [[ ! -s "$FILTERED_CONTIGS" ]]; then
+          echo "[`date`] No contigs ≥${STATS_MINLEN} bp; skipping stats."
+        else
+          # get one header+one data line, then pull only the data
+          stats_data=$(seqkit stats -a -N 50 -T "$FILTERED_CONTIGS" | tail -n1)
 
-      # compute weighted GC% across all ≥1 kb contigs
-      GC=$(seqkit fx2tab -g "$FILTERED_CONTIGS" \
-           | tail -n+2 \
-           | awk '{
-               len=$2; gcpct=$3/100;
-               total_len+=len; total_gc+=len*gcpct
-             }
-             END { printf("%.2f", total_gc/total_len*100) }'
-      )
+          NUM_SEQS=$( echo "$stats_data" | cut -f4 )
+          SUM_LEN=$(  echo "$stats_data" | cut -f5 )
+          MIN_LEN=$(  echo "$stats_data" | cut -f6 )
+          AVG_LEN=$(  echo "$stats_data" | cut -f7 )
+          MAX_LEN=$(  echo "$stats_data" | cut -f8 )
+          N50=$(      echo "$stats_data" | cut -f9 )
+          L50=$(      echo "$stats_data" | cut -f10 )
 
-      {
-        echo "CONTIGS-${STATS_MINLEN}BP:    $NUM_SEQS"
-        echo "ASSEMBLY_LEN-${STATS_MINLEN}BP:    $SUM_LEN"
-        echo "LARGEST_CONTIG:   $MAX_LEN"
-        echo "N50-${STATS_MINLEN}BP:           $N50"
-        echo "L50-${STATS_MINLEN}BP:           $L50"
-        echo "GC-${STATS_MINLEN}BP:            ${GC}%"
-      } | tee "$ASSEMBLY_STATS"
+          N50=${N50%.*}
+          L50=${L50%.*}
+
+          # weighted GC% across all ≥1 kb contigs
+          GC=$( seqkit fx2tab -g "$FILTERED_CONTIGS" \
+             | tail -n+2 \
+             | awk '{
+                 len=$2;       # column 2 is length
+                 gcpct=$4/100;# column 4 is percentage
+                 total_len+=len;
+                 total_gc+=len*gcpct
+               }
+               END {
+                 if (total_len>0)
+                   printf("%.2f", total_gc/total_len*100);
+                 else
+                   printf("0.00")
+               }' )
+
+
+          {
+            echo "CONTIGS-${STATS_MINLEN}BP:    $NUM_SEQS"
+            echo "ASSEMBLY_LEN-${STATS_MINLEN}BP:    $SUM_LEN"
+            echo "LARGEST_CONTIG:   $MAX_LEN"
+            echo "N50-${STATS_MINLEN}BP:           $N50"
+            echo "L50-${STATS_MINLEN}BP:           $L50"
+            echo "GC-${STATS_MINLEN}BP:            ${GC}%"
+          } | tee "$ASSEMBLY_STATS"
+
+        fi
+      fi
 
       echo
+
 
       # ─── ITS extraction ─────────────────────────────────────────────────────────
       t_its_start=$(date +%s)
