@@ -414,7 +414,6 @@ for fp in "$READS_DIR"/*; do
       t_asm_end=$(date +%s)
 
 
-
       # ─── Assembly stats (contigs ≥1 kb) ────────────────────────────────────
       CONTIG_DIR=$(dirname "$CONTIG")
       STATS_MINLEN=1000
@@ -422,19 +421,19 @@ for fp in "$READS_DIR"/*; do
       ASSEMBLY_STATS="${CONTIG_DIR}/assembly_stats.${STATS_MINLEN}bp.txt"
 
       if [[ -s "$ASSEMBLY_STATS" ]]; then
-        echo "[`date`] Skipping assembly stats (found): $ASSEMBLY_STATS"
+        echo "[$(date)] Skipping assembly stats (found): $ASSEMBLY_STATS"
       else
-        echo "[`date`] Computing assembly stats (contigs ≥ ${STATS_MINLEN} bp)"
+        echo "[$(date)] Computing assembly stats (contigs ≥ ${STATS_MINLEN} bp)"
         conda activate ssuitslsu-itsx
 
         # extract only contigs ≥1 kb
-        seqkit seq -m ${STATS_MINLEN} "$CONTIG" -o "$FILTERED_CONTIGS"
+        seqkit seq -m${STATS_MINLEN} "$CONTIG" -o "$FILTERED_CONTIGS"
 
         # if nothing survives, bail out
         if [[ ! -s "$FILTERED_CONTIGS" ]]; then
-          echo "[`date`] No contigs ≥${STATS_MINLEN} bp; skipping stats."
+          echo "[$(date)] No contigs ≥${STATS_MINLEN} bp; skipping stats."
         else
-          # get one header+one data line, then pull only the data
+          # grab the one data line from seqkit stats
           stats_data=$(seqkit stats -a -N 50 -T "$FILTERED_CONTIGS" | tail -n1)
 
           NUM_SEQS=$( echo "$stats_data" | cut -f4 )
@@ -445,25 +444,27 @@ for fp in "$READS_DIR"/*; do
           N50=$(      echo "$stats_data" | cut -f9 )
           L50=$(      echo "$stats_data" | cut -f10 )
 
+          # drop decimals
           N50=${N50%.*}
           L50=${L50%.*}
 
-          # weighted GC% across all ≥1 kb contigs
-          GC=$( seqkit fx2tab -g "$FILTERED_CONTIGS" \
-             | tail -n+2 \
-             | awk '{
-                 len=$2;       # column 2 is length
-                 gcpct=$4/100;# column 4 is percentage
-                 total_len+=len;
-                 total_gc+=len*gcpct
-               }
-               END {
-                 if (total_len>0)
-                   printf("%.2f", total_gc/total_len*100);
-                 else
-                   printf("0.00")
-               }' )
-
+          # compute weighted GC% across all filtered contigs
+          GC=$(awk '
+            /^>/ { next }
+            {
+              seq = $0
+              total_len += length(seq)
+              # count G/C
+              gc += gsub(/[GgCc]/, "", seq)
+            }
+            END {
+              if (total_len > 0) {
+                printf("%.2f", gc/total_len*100)
+              } else {
+                printf("0.00")
+              }
+            }
+          ' "$FILTERED_CONTIGS")
 
           {
             echo "CONTIGS-${STATS_MINLEN}BP:    $NUM_SEQS"
@@ -473,11 +474,11 @@ for fp in "$READS_DIR"/*; do
             echo "L50-${STATS_MINLEN}BP:           $L50"
             echo "GC-${STATS_MINLEN}BP:            ${GC}%"
           } | tee "$ASSEMBLY_STATS"
-
         fi
       fi
 
       echo
+
 
 
       # ─── ITS extraction ─────────────────────────────────────────────────────────
