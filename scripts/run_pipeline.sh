@@ -56,6 +56,14 @@ TRIMMOMATIC_ADAPTERS=$(shyaml get-value trimmomatic_adapters < "$CONFIG")
 # ensure it's never unset or empty
 TRIMMOMATIC_ADAPTERS=${TRIMMOMATIC_ADAPTERS:-auto}
 
+# new coverage thresholds (×)
+max_coverage=$(shyaml get-value max_coverage   < "$CONFIG")
+target_coverage=$(shyaml get-value target_coverage < "$CONFIG")
+# fall back to defaults if not set in pipeline.yaml
+max_coverage=${max_coverage:-100}
+target_coverage=${target_coverage:-90}
+
+
 # Strip stray quotes (so paths with spaces work)
 for var in READS_DIR TAXO_XLSX REF_FASTA TRIMMOMATIC_ADAPTERS; do
   val="${!var}"
@@ -117,23 +125,34 @@ if [[ "$ASSEMBLER" != "spades" && "$ASSEMBLER" != "megahit" ]]; then
   exit 1
 fi
 
-# 3) Validate config
+# ─── 3) Validate config ─────────────────────────────────────────────
 die(){ echo "ERROR: $*" >&2; exit 1; }
-[[ -d "$READS_DIR"     ]] || die "reads_dir not found: $READS_DIR"
-[[ -f "$TAXO_XLSX"     ]] || die "taxonomy_file not found: $TAXO_XLSX"
-[[ -f "$REF_FASTA"     ]] || die "ref_fasta not found: $REF_FASTA"
+
+# ensure reads / taxonomy / reference exist
+[[ -d "$READS_DIR" ]]  || die "reads_dir not found: $READS_DIR"
+[[ -f "$TAXO_XLSX" ]]  || die "taxonomy_file not found: $TAXO_XLSX"
+[[ -f "$REF_FASTA" ]]  || die "ref_fasta not found: $REF_FASTA"
+
+# trimmomatic adapters if not "auto"
 if [[ -n "$TRIMMOMATIC_ADAPTERS" && "$TRIMMOMATIC_ADAPTERS" != "auto" ]]; then
-  [[ -f "$TRIMMOMATIC_ADAPTERS" ]] || {
-    echo "ERROR: trimmomatic_adapters not found: $TRIMMOMATIC_ADAPTERS" >&2
-    exit 1
-  }
+  [[ -f "$TRIMMOMATIC_ADAPTERS" ]] \
+    || die "trimmomatic_adapters not found: $TRIMMOMATIC_ADAPTERS"
 fi
 
+# new: coverage thresholds (for auto‐subsampling)
+max_coverage=$(shyaml get-value max_coverage   < "$CONFIG")
+target_coverage=$(shyaml get-value target_coverage< "$CONFIG")
+# must be numeric and >0
+[[ "$max_coverage" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "max_coverage must be numeric: $max_coverage"
+[[ "$target_coverage" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "target_coverage must be numeric: $target_coverage"
+
 echo "Running with:"
-echo "  skip_trimming = $SKIP_TRIM"
-echo "  threads       = $THREADS"
-echo "  mem_gb        = $MEM_GB"
-echo "  adapters      = $TRIMMOMATIC_ADAPTERS"
+echo "  skip_trimming    = $SKIP_TRIM"
+echo "  threads          = $THREADS"
+echo "  mem_gb           = $MEM_GB"
+echo "  adapters         = $TRIMMOMATIC_ADAPTERS"
+echo "  max_coverage     = ${max_coverage}×"
+echo "  target_coverage  = ${target_coverage}×"
 echo
 
 mkdir -p "$OUTDIR"
@@ -311,33 +330,81 @@ for fp in "$READS_DIR"/*; do
       R2="$out_rev"
 
 
-      # ─── Mapping ────────────────────────────────────────────────
+      # ─── Mapping + auto‐subsampling ──────────────────────────────────────────────
       t_map_start=$(date +%s)
       BAM="$SAMPLE_DIR/${sample}.sorted.bam"
+      sub1="$SAMPLE_DIR/${sample}.sub_1P.fastq.gz"
+      sub2="$SAMPLE_DIR/${sample}.sub_2P.fastq.gz"
+
+      conda activate ssuitslsu-mapping
+
+      # 1) initial mapping if needed
       if [[ ! -f "$BAM" ]]; then
-        conda activate ssuitslsu-mapping
-        [[ ! -f "$SAMPLE_REF.bwt.2bit.64" ]] && bwa-mem2 index "$SAMPLE_REF"
-        echo "[`date`] Mapping reads"
+        # build the index if needed
+        [[ ! -f "${SAMPLE_REF}.bwt.2bit.64" ]] && bwa-mem2 index "$SAMPLE_REF"
+
+        echo "[$(date)] Mapping reads (MAPQ ≥ 30, properly paired only)"
         bwa-mem2 mem -v0 -t "$THREADS" "$SAMPLE_REF" "$R1" "$R2" \
           2> "$SAMPLE_DIR/mapping.log" \
-          | samtools view -bS - \
-          | samtools sort -@ "$THREADS" -o "$BAM"
-      else
-        echo "[`date`] Skipping mapping (exists)"
-      fi
-      [[ ! -s "$BAM" ]] && echo "!! Empty BAM; skipping" && continue 2
+        | samtools view -b -q 30 -f 2 -F 4 -@ "$THREADS" \
+        | samtools sort -@ "$THREADS" -o "$BAM"
 
-      # Extract mapped
+        samtools index "$BAM"
+      else
+        echo "[$(date)] Skipping mapping (BAM exists)"
+        [[ ! -f "${BAM}.bai" ]] && samtools index "$BAM"
+      fi
+
+      # fail early if no alignments
+      [[ ! -s "$BAM" ]] && echo "!! Empty BAM; skipping sample" && continue 2
+
+      # 2) coverage check + optional subsampling
+      if [[ ! -f "$sub1" && ! -f "$sub2" ]]; then
+        mean_cov=$(samtools depth -a "$BAM" \
+                   | awk '{sum+=$3; cnt++} END {print (cnt? sum/cnt : 0)}')
+        printf "[%s] Mean coverage: %.1f×\n" "$(date)" "$mean_cov"
+
+        if (( $(echo "$mean_cov > $max_coverage" | bc -l) )); then
+          printf "[%s] Coverage > %d×, subsampling to ~%d×\n" \
+                 "$(date)" "$max_coverage" "$target_coverage"
+
+          frac=$(awk -v t=$target_coverage -v m=$mean_cov 'BEGIN{print t/m}')
+
+          seqtk sample -s100 "$R1" "$frac" | gzip > "$sub1"
+          seqtk sample -s100 "$R2" "$frac" | gzip > "$sub2"
+
+          # swap in subsampled reads
+          R1="$sub1"
+          R2="$sub2"
+
+          echo "[$(date)] Remapping subsampled reads"
+          rm -f "$BAM" "${BAM}.bai"
+          bwa-mem2 mem -v0 -t "$THREADS" "$SAMPLE_REF" "$R1" "$R2" \
+            2> "$SAMPLE_DIR/mapping.log" \
+          | samtools view -b -q 30 -f 2 -F 4 -@ "$THREADS" \
+          | samtools sort -@ "$THREADS" -o "$BAM"
+          samtools index "$BAM"
+
+          printf "[%s] Subsampled mapping complete\n" "$(date)"
+        fi
+      else
+        echo "[$(date)] Subsample already done; skipping coverage check"
+      fi
+
+      # ─── Extract mapped reads ─────────────────────────────────────────────────
       P1="$SAMPLE_DIR/${sample}.mapped_1.fastq.gz"
       P2="$SAMPLE_DIR/${sample}.mapped_2.fastq.gz"
       U0="$SAMPLE_DIR/${sample}.mapped_0.fastq.gz"
+
       if [[ ! -f "$P1" ]]; then
-        echo "[`date`] Extracting mapped reads"
+        echo "[$(date)] Extracting mapped reads"
         samtools fastq -@ "$THREADS" -1 "$P1" -2 "$P2" -0 "$U0" "$BAM"
       else
-        echo "[`date`] Skipping extraction (exists)"
+        echo "[$(date)] Skipping extraction (exists)"
       fi
+
       t_map_end=$(date +%s)
+
 
       # ─── Assembly ────────────────────────────────────────────────────────
       t_asm_start=$(date +%s)
@@ -360,7 +427,7 @@ for fp in "$READS_DIR"/*; do
           fi
 
           # run SPAdes, capturing its log
-          cmd=(spades.py --only-assembler \
+          cmd=(spades.py --careful \
             -1 "$P1" -2 "$P2" \
             -t "$THREADS" -m "$MEM_GB" \
             -o "$SP_DIR")
@@ -402,7 +469,7 @@ for fp in "$READS_DIR"/*; do
           [[ -f "$U0" ]] && cmd+=( -r "$U0" )
 
           # run and capture the log
-          "${cmd[@]}" 2>&1 | tee "$ASM_DIR/megahit.log"
+          "${cmd[@]}" 2>&1 | tee "$MH_DIR/megahit.log"
         else
           echo "[`date`] Skipping MEGAHIT assembly (exists)"
         fi
@@ -414,7 +481,7 @@ for fp in "$READS_DIR"/*; do
       t_asm_end=$(date +%s)
 
 
-            # ─── Assembly stats (contigs ≥1 kb) ────────────────────────────────────
+            # ─── Assembly stats (contigs ≥1 kb) + 45S coverage ────────────────────────────────────
       CONTIG_DIR=$(dirname "$CONTIG")
       STATS_MINLEN=1000
       FILTERED_CONTIGS="${CONTIG_DIR}/contigs.${STATS_MINLEN}bp.fasta"
@@ -445,6 +512,10 @@ for fp in "$READS_DIR"/*; do
           L50=$(     echo "$stats_data" | cut -f14)
           GC_PCT=$(  echo "$stats_data" | cut -f18 | tr -d '%')
 
+          # 4) compute mean coverage across the SSU+ITS+LSU reference(s)
+          mean_45S_cov=$(samtools depth -a "$BAM" \
+                           | awk '{sum+=$3; cnt++} END{ if(cnt) printf("%.1f", sum/cnt); else print "0.0" }')
+
           {
             echo "CONTIGS-${STATS_MINLEN}BP:    $NUM_SEQS"
             echo "ASSEMBLY_LEN-${STATS_MINLEN}BP:    $SUM_LEN"
@@ -452,13 +523,12 @@ for fp in "$READS_DIR"/*; do
             echo "N50-${STATS_MINLEN}BP:           $N50"
             echo "L50-${STATS_MINLEN}BP:           $L50"
             echo "GC-${STATS_MINLEN}BP:            ${GC_PCT}%"
+            echo "MEAN_COV-45S:     ${mean_45S_cov}×"
           } | tee "$ASSEMBLY_STATS"
         fi
       fi
 
       echo
-
-
 
 
       # ─── ITS extraction ─────────────────────────────────────────────────────────
@@ -508,8 +578,9 @@ for fp in "$READS_DIR"/*; do
           touch "$ITSX_DIR/${sample}_no_detections.txt"
         else
           echo "[`date`] Running ITSx for $sample"
+          pushd "$ITSX_DIR" >/dev/null
           ITSx -i "$FILTERED" \
-               -o "$ITSX_DIR/${sample}" \
+               -o "$sample" \
                --preserve T \
                --only_full T \
                --save_regions all \
@@ -517,6 +588,7 @@ for fp in "$READS_DIR"/*; do
                --region all \
                --anchor HMM \
                --cpu "$THREADS"
+          popd >/dev/null
         fi
       fi
       #               
@@ -570,7 +642,7 @@ for fp in "$READS_DIR"/*; do
           t_align_start=$(date +%s)
           conda activate ssuitslsu-mafft
           printf "[%s] Running MAFFT → %s\n" "$(date)" "$PHYLO_ALN"
-          mafft --auto "$GEN_FASTA" > "$PHYLO_ALN"
+          mafft --thread "$THREADS" --auto "$GEN_FASTA" > "$PHYLO_ALN"
           t_align_end=$(date +%s)
           printf "\n"
         fi
@@ -587,6 +659,9 @@ for fp in "$READS_DIR"/*; do
           iqtree \
             -s "$PHYLO_ALN" \
             -m MFP \
+            -nt AUTO \
+            -ntmax "${THREADS}" \
+            -mem "${MEM_GB}" \
             -nt AUTO \
             -bb 1000 \
             -pre "$PHYLO_PREFIX"

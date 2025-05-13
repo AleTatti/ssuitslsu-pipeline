@@ -51,6 +51,9 @@ taxonomy_sheet: "Taxonomy"
 # ref_fasta: "/path/to/custom_reference.fasta"
 trimmomatic_adapters: auto  # auto‐located in the trimmomatic env
 tskip_trimming: false # true to use existing *_trimmed FASTQs
+auto_subsample: true       # always check coverage and subsample if needed
+max_coverage: 100          # threshold (×) above which to downsample
+target_coverage: 90        # aim (×) when subsampling
 assembler: spades           # or "megahit"
 threads: 8
 mem_gb: 16
