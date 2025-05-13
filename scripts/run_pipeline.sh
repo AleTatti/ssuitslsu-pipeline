@@ -578,7 +578,6 @@ for fp in "$READS_DIR"/*; do
           touch "$ITSX_DIR/${sample}_no_detections.txt"
         else
           echo "[`date`] Running ITSx for $sample"
-          pushd "$ITSX_DIR" >/dev/null
           ITSx -i "$FILTERED" \
                -o "$sample" \
                --preserve T \
@@ -588,7 +587,6 @@ for fp in "$READS_DIR"/*; do
                --region all \
                --anchor HMM \
                --cpu "$THREADS"
-          popd >/dev/null
         fi
       fi
       #               
