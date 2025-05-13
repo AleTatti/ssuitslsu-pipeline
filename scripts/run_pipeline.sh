@@ -329,6 +329,10 @@ for fp in "$READS_DIR"/*; do
       R1="$out_fw"
       R2="$out_rev"
 
+      init_p1=$(zgrep -c '^@' "$R1")
+      init_p2=$(zgrep -c '^@' "$R2")
+      echo "Initial trimmed: $init_p1 reads in R1, $init_p2 reads in R2"
+
 
       # ─── Mapping + auto‐subsampling ──────────────────────────────────────────────
       t_map_start=$(date +%s)
@@ -396,12 +400,25 @@ for fp in "$READS_DIR"/*; do
       P2="$SAMPLE_DIR/${sample}.mapped_2.fastq.gz"
       U0="$SAMPLE_DIR/${sample}.mapped_0.fastq.gz"
 
-      if [[ ! -f "$P1" ]]; then
+      # re-extract if missing, empty, or older than the BAM
+      if [[ ! -s "$P1" || "$BAM" -nt "$P1" ]]; then
         echo "[$(date)] Extracting mapped reads"
-        samtools fastq -@ "$THREADS" -1 "$P1" -2 "$P2" -0 "$U0" "$BAM"
+        rm -f "$P1" "$P2" "$U0"
+        samtools fastq -@ "$THREADS" \
+        -1 "$P1" -2 "$P2" -0 "$U0" "$BAM"
       else
-        echo "[$(date)] Skipping extraction (exists)"
+        echo "[$(date)] Mapped FASTQs up-to-date; skipping extraction"
       fi
+
+      # Count *mapped* reads
+      map_p1=$(zgrep -c '^@' "$P1")
+      map_p2=$(zgrep -c '^@' "$P2")
+      echo "Mapped reads:    $map_p1 reads in R1, $map_p2 reads in R2"
+
+      #mapping rates
+      rate1=$(awk "BEGIN { printf \"%.2f\", ($map_p1/$init_p1)*100 }")
+      rate2=$(awk "BEGIN { printf \"%.2f\", ($map_p2/$init_p2)*100 }")
+      echo "Mapping rate:    R1: $rate1%   R2: $rate2%"
 
       t_map_end=$(date +%s)
 
@@ -420,18 +437,18 @@ for fp in "$READS_DIR"/*; do
           echo "[`date`] Assembling with SPAdes"
           mkdir -p "$SP_DIR"
 
-          # — remove empty singletons just like before
-          if [[ -f "$U0" ]] && ! zgrep -q '^@' "$U0"; then
-            echo "→ Removing empty singleton"
-            rm -f "$U0"
-          fi
-
-          # run SPAdes, capturing its log
-          cmd=(spades.py --careful \
-            -1 "$P1" -2 "$P2" \
-            -t "$THREADS" -m "$MEM_GB" \
-            -o "$SP_DIR")
-          [[ -f "$U0" ]] && cmd+=( -s "$U0" )
+        # only pass -s if U0 actually has reads
+        if [[ -s "$U0" ]]; then
+          echo "→ Including $(zgrep -c '^@' "$U0") singletons"
+        else
+          echo "→ No singletons; not adding -s flag"
+          rm -f "$U0"
+        fi
+        cmd=(spades.py --careful \
+          -1 "$P1" -2 "$P2" \
+          -t "$THREADS" -m "$MEM_GB" \
+          -o "$SP_DIR")
+          [[ -s "$U0" ]] && cmd+=( -s "$U0" )
           "${cmd[@]}" 2>&1 | tee "$SP_DIR/spades.log"
         else
           echo "[`date`] Skipping SPAdes assembly (exists)"
@@ -578,7 +595,6 @@ for fp in "$READS_DIR"/*; do
           touch "$ITSX_DIR/${sample}_no_detections.txt"
         else
           echo "[`date`] Running ITSx for $sample"
-          pushd "$ITSX_DIR" >/dev/null
           ITSx -i "$FILTERED" \
                -o "$sample" \
                --preserve T \
@@ -588,7 +604,6 @@ for fp in "$READS_DIR"/*; do
                --region all \
                --anchor HMM \
                --cpu "$THREADS"
-          popd >/dev/null
         fi
       fi
       #               
