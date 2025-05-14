@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+t_align_start=0
+t_align_end=0
+t_phylo_start=0
+t_phylo_end=0
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Usage/help message
@@ -55,14 +59,12 @@ OUTDIR=$(shyaml get-value outdir                 < "$CONFIG")
 TRIMMOMATIC_ADAPTERS=$(shyaml get-value trimmomatic_adapters < "$CONFIG")
 # ensure it's never unset or empty
 TRIMMOMATIC_ADAPTERS=${TRIMMOMATIC_ADAPTERS:-auto}
-
 # new coverage thresholds (×)
-max_coverage=$(shyaml get-value max_coverage   < "$CONFIG")
+max_coverage=$(shyaml get-value max_coverage < "$CONFIG")
 target_coverage=$(shyaml get-value target_coverage < "$CONFIG")
 # fall back to defaults if not set in pipeline.yaml
 max_coverage=${max_coverage:-100}
 target_coverage=${target_coverage:-90}
-
 
 # Strip stray quotes (so paths with spaces work)
 for var in READS_DIR TAXO_XLSX REF_FASTA TRIMMOMATIC_ADAPTERS; do
@@ -138,13 +140,6 @@ if [[ -n "$TRIMMOMATIC_ADAPTERS" && "$TRIMMOMATIC_ADAPTERS" != "auto" ]]; then
   [[ -f "$TRIMMOMATIC_ADAPTERS" ]] \
     || die "trimmomatic_adapters not found: $TRIMMOMATIC_ADAPTERS"
 fi
-
-# new: coverage thresholds (for auto‐subsampling)
-max_coverage=$(shyaml get-value max_coverage   < "$CONFIG")
-target_coverage=$(shyaml get-value target_coverage< "$CONFIG")
-# must be numeric and >0
-[[ "$max_coverage" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "max_coverage must be numeric: $max_coverage"
-[[ "$target_coverage" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "target_coverage must be numeric: $target_coverage"
 
 echo "Running with:"
 echo "  skip_trimming    = $SKIP_TRIM"
@@ -240,6 +235,7 @@ for fp in "$READS_DIR"/*; do
       echo "[`date`] ===> Processing $sample"; t0=$(date +%s)
 
       # ─── Reference Selection ────────────────────────────────────────────────
+      t_ref_start=$(date +%s)
       taxo_line=$(grep -m1 "^${sample}," "$TAX_CSV" || true)
       [[ -z "$taxo_line" ]] && echo "!! No taxonomy for $sample; skipping" >&2 && continue 2
       IFS=, read -r _ phylum cls ord fam subfam tribe gen spp subspp <<<"$taxo_line"
@@ -278,6 +274,7 @@ for fp in "$READS_DIR"/*; do
         fi
       done
       [[ -z "$SAMPLE_REF" ]] && echo "!! No reference found; skipping" >&2 && continue 2
+      t_ref_end=$(date +%s)
 
       # ─── Trimming ────────────────────────────────────────────────
       t_trim_start=$(date +%s)
@@ -329,6 +326,10 @@ for fp in "$READS_DIR"/*; do
       R1="$out_fw"
       R2="$out_rev"
 
+      #init_p1=$(zgrep -c '^@' "$R1")
+      #init_p2=$(zgrep -c '^@' "$R2")
+      #echo "Initial trimmed: $init_p1 reads in R1, $init_p2 reads in R2"
+
 
       # ─── Mapping + auto‐subsampling ──────────────────────────────────────────────
       t_map_start=$(date +%s)
@@ -359,7 +360,8 @@ for fp in "$READS_DIR"/*; do
       [[ ! -s "$BAM" ]] && echo "!! Empty BAM; skipping sample" && continue 2
 
       # 2) coverage check + optional subsampling
-      if [[ ! -f "$sub1" && ! -f "$sub2" ]]; then
+      subbam="$SAMPLE_DIR/${sample}.subsampled.bam"
+      if [[ ! -f "$subbam" ]]; then
         mean_cov=$(samtools depth -a "$BAM" \
                    | awk '{sum+=$3; cnt++} END {print (cnt? sum/cnt : 0)}')
         printf "[%s] Mean coverage: %.1f×\n" "$(date)" "$mean_cov"
@@ -368,27 +370,46 @@ for fp in "$READS_DIR"/*; do
           printf "[%s] Coverage > %d×, subsampling to ~%d×\n" \
                  "$(date)" "$max_coverage" "$target_coverage"
 
-          frac=$(awk -v t=$target_coverage -v m=$mean_cov 'BEGIN{print t/m}')
+          frac=$(awk -v t="${target_coverage}" -v m="${mean_cov}" 'BEGIN{print t/m}')
 
-          seqtk sample -s100 "$R1" "$frac" | gzip > "$sub1"
-          seqtk sample -s100 "$R2" "$frac" | gzip > "$sub2"
+          # 1) subsample the mapped BAM
+          subbam="$SAMPLE_DIR/${sample}.subsampled.bam"
+          echo "[$(date)] Subsampling BAM to ~${target_coverage}× (frac=$frac)"
+          samtools view -b -@ "$THREADS" -s "$frac" "$BAM" > "$subbam"
+          samtools index "$subbam"
+          BAM="$subbam"
 
-          # swap in subsampled reads
-          R1="$sub1"
-          R2="$sub2"
+          # 2) extract paired FASTQs in one go (no singleton file)
+          P1="$SAMPLE_DIR/${sample}.mapped_1.fastq.gz"
+          P2="$SAMPLE_DIR/${sample}.mapped_2.fastq.gz"
+          echo "[$(date)] Streaming collate→fastq from subsampled BAM"
+          rm -f "$P1" "$P2"
+          samtools view -h -@ "$THREADS" \
+              -b -f 2 \
+              -F 2304 \
+              -q 30 \
+              "$BAM" |
+          samtools collate -uO -@ "$THREADS" - |
+          samtools fastq -@ "$THREADS" \
+              -1 "$P1" \
+              -2 "$P2" \
+              -s /dev/null -
 
-          echo "[$(date)] Remapping subsampled reads"
-          rm -f "$BAM" "${BAM}.bai"
-          bwa-mem2 mem -v0 -t "$THREADS" "$SAMPLE_REF" "$R1" "$R2" \
-            2> "$SAMPLE_DIR/mapping.log" \
-          | samtools view -b -q 30 -f 2 -F 4 -@ "$THREADS" \
-          | samtools sort -@ "$THREADS" -o "$BAM"
-          samtools index "$BAM"
+          # final sanity check
+          p1=$(zgrep -c '^@' "$P1")
+          p2=$(zgrep -c '^@' "$P2")
+          if [[ "$p1" -ne "$p2" ]]; then
+            echo "[ERROR] mate-pairs mismatch: R1=$p1 vs R2=$p2" >&2
+            exit 1
+          fi
+          echo "[$(date)] Extracted $p1 perfectly paired reads"
 
-          printf "[%s] Subsampled mapping complete\n" "$(date)"
+        else
+          echo "[$(date)] Coverage ≤ ${max_coverage}×; no subsampling"
         fi
       else
-        echo "[$(date)] Subsample already done; skipping coverage check"
+        echo "[$(date)] Subsampled BAM exists; skipping coverage check"
+        BAM="$subbam"
       fi
 
       # ─── Extract mapped reads ─────────────────────────────────────────────────
@@ -396,12 +417,45 @@ for fp in "$READS_DIR"/*; do
       P2="$SAMPLE_DIR/${sample}.mapped_2.fastq.gz"
       U0="$SAMPLE_DIR/${sample}.mapped_0.fastq.gz"
 
-      if [[ ! -f "$P1" ]]; then
-        echo "[$(date)] Extracting mapped reads"
-        samtools fastq -@ "$THREADS" -1 "$P1" -2 "$P2" -0 "$U0" "$BAM"
+      # re-extract if missing, empty, or older than the BAM
+      if [[ ! -s "$P1" || ! -s "$P2" || "$BAM" -nt "$P1" || "$BAM" -nt "$P2" ]]; then
+        echo "[$(date)] Extracting properly-paired primary alignments"
+        rm -f "$P1" "$P2" "$U0"
+        # filter out secondary/supplementary, require proper-pair & MAPQ≥30,
+        # then fastq only R1/R2 (drop others into /dev/null)
+        samtools view -h -@ "$THREADS" \
+          -b -f 2 \
+          -F 2304 \
+          -q 30 \
+          "$BAM" |
+        samtools collate -uO -@ "$THREADS" - |
+        samtools fastq -@ "$THREADS" \
+          -1 "$P1" \
+          -2 "$P2" \
+          -s /dev/null -
+
+        # sanity check: ensure mate-pairs match
+        p1=$(zgrep -c '^@' "$P1")
+        p2=$(zgrep -c '^@' "$P2")
+        if [[ "$p1" -ne "$p2" ]]; then
+          echo "[ERROR] mate-pair counts mismatch: R1=$p1 vs R2=$p2" >&2
+          exit 1
+        fi
+        echo "[$(date)] Extracted $p1 paired reads each in P1/P2"
+
       else
-        echo "[$(date)] Skipping extraction (exists)"
+        echo "[$(date)] Mapped FASTQs up-to-date; skipping extraction"
       fi
+
+      # Count *mapped* reads
+      #map_p1=$(zgrep -c '^@' "$P1")
+      #map_p2=$(zgrep -c '^@' "$P2")
+      #echo "Mapped reads:    $map_p1 reads in R1, $map_p2 reads in R2"
+
+      #mapping rates
+      #rate1=$(awk "BEGIN { printf \"%.2f\", ($map_p1/$init_p1)*100 }")
+      #rate2=$(awk "BEGIN { printf \"%.2f\", ($map_p2/$init_p2)*100 }")
+      #echo "Mapping rate:    R1: $rate1%   R2: $rate2%"
 
       t_map_end=$(date +%s)
 
@@ -420,18 +474,18 @@ for fp in "$READS_DIR"/*; do
           echo "[`date`] Assembling with SPAdes"
           mkdir -p "$SP_DIR"
 
-          # — remove empty singletons just like before
-          if [[ -f "$U0" ]] && ! zgrep -q '^@' "$U0"; then
-            echo "→ Removing empty singleton"
-            rm -f "$U0"
-          fi
-
-          # run SPAdes, capturing its log
-          cmd=(spades.py --careful \
-            -1 "$P1" -2 "$P2" \
-            -t "$THREADS" -m "$MEM_GB" \
-            -o "$SP_DIR")
-          [[ -f "$U0" ]] && cmd+=( -s "$U0" )
+        # only pass -s if U0 actually has reads
+        if [[ -s "$U0" ]]; then
+          echo "→ Including $(zgrep -c '^@' "$U0") singletons"
+        else
+          echo "→ No singletons; not adding -s flag"
+          rm -f "$U0"
+        fi
+        cmd=(spades.py --careful \
+          -1 "$P1" -2 "$P2" \
+          -t "$THREADS" -m "$MEM_GB" \
+          -o "$SP_DIR")
+          [[ -s "$U0" ]] && cmd+=( -s "$U0" )
           "${cmd[@]}" 2>&1 | tee "$SP_DIR/spades.log"
         else
           echo "[`date`] Skipping SPAdes assembly (exists)"
@@ -445,10 +499,14 @@ for fp in "$READS_DIR"/*; do
           conda activate ssuitslsu-megahit
           echo "[`date`] Assembling with MEGAHIT"
 
-          # — remove empty singleton just like before
-          if [[ -f "$U0" ]] && ! zgrep -q '^@' "$U0"; then
-            echo "→ Removing empty singleton"
-            rm -f "$U0"
+          # — delete U0 if it contains no FASTQ records
+          if [[ -f "$U0" ]]; then
+              if ! zgrep -q '^@' "$U0"; then
+                  echo "→ Removing empty singleton"
+                  rm -f "$U0"
+              else
+                  echo "→ Including $(zgrep -c '^@' "$U0") singletons"
+              fi
           fi
 
           # ─── Clear any old output
@@ -533,7 +591,8 @@ for fp in "$READS_DIR"/*; do
 
       # ─── ITS extraction ─────────────────────────────────────────────────────────
       t_its_start=$(date +%s)
-      ITSX_DIR="$SAMPLE_DIR/itsx"; mkdir -p "$ITSX_DIR"
+      ITSX_DIR="${SAMPLE_DIR}/itsx"
+      mkdir -p "$ITSX_DIR"
       FULL_OUT="$ITSX_DIR/${sample}.full.fasta"
 
       if [[ -s "$FULL_OUT" ]]; then
@@ -579,7 +638,7 @@ for fp in "$READS_DIR"/*; do
         else
           echo "[`date`] Running ITSx for $sample"
           ITSx -i "$FILTERED" \
-               -o "$sample" \
+               -o "${ITSX_DIR}/${sample}" \
                --preserve T \
                --only_full T \
                --save_regions all \
@@ -628,6 +687,7 @@ for fp in "$READS_DIR"/*; do
           $0 ~ ("(^|;)" tag "(;|$)") { print ">" $0 }
         ' "$REF_FASTA" > "$GEN_FASTA"
         # append our contig with sample tag
+        conda activate ssuitslsu-itsx
         seqkit replace \
           -p '^>(.+)' -r ">${sample}_\1" \
           "$orig_contig_fasta" >> "$GEN_FASTA"
@@ -659,7 +719,7 @@ for fp in "$READS_DIR"/*; do
             -m MFP \
             -nt AUTO \
             -ntmax "${THREADS}" \
-            -mem "${MEM_GB}" \
+            -mem "${MEM_GB}G" \
             -nt AUTO \
             -bb 1000 \
             -pre "$PHYLO_PREFIX"
@@ -674,6 +734,7 @@ for fp in "$READS_DIR"/*; do
       end_ts=$(date +"%Y-%m-%d %H:%M:%S")
       elapsed=$((t1 - t0))
 
+      ref_dur=$((t_ref_end - t_ref_start))
       trim_dur=$((t_trim_end - t_trim_start))
       map_dur=$((t_map_end  - t_map_start))
       asm_dur=$((t_asm_end  - t_asm_start))
@@ -685,6 +746,7 @@ for fp in "$READS_DIR"/*; do
         "$sample" "$start_ts" "$end_ts" \
         $((elapsed/3600)) $(((elapsed%3600)/60)) $((elapsed%60))
 
+      printf "    Taxonomical Rank Selection:   %02dm%02ds\n" $((ref_dur/60)) $((ref_dur%60))
       printf "    Trimming:   %02dm%02ds\n" $((trim_dur/60)) $((trim_dur%60))
       printf "    Mapping:    %02dm%02ds\n" $((map_dur/60)) $((map_dur%60))
       printf "    Assembly:   %02dm%02ds\n" $((asm_dur/60)) $((asm_dur%60))
