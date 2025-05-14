@@ -279,52 +279,51 @@ for fp in "$READS_DIR"/*; do
       # ─── Trimming ────────────────────────────────────────────────
       t_trim_start=$(date +%s)
 
+      # remember raw inputs
+      RAW_R1="$R1"
+      RAW_R2="$R2"
+
       out_fw="$SAMPLE_DIR/${sample}_trimmed_1P.fastq.gz"
       out_rev="$SAMPLE_DIR/${sample}_trimmed_2P.fastq.gz"
       un_fw="$SAMPLE_DIR/${sample}_trimmed_1U.fastq.gz"
       un_rev="$SAMPLE_DIR/${sample}_trimmed_2U.fastq.gz"
 
       if [[ "$SKIP_TRIM" == "true" ]]; then
-        echo "[`date`] skip_trimming; checking for existing trimmed files"
-        if [[ -f "$out_fw" ]] && [[ -f "$out_rev" ]]; then
-          echo "[`date`] Found trimmed files; using them"
-        else
-          die "skip_trimming is true but missing: $out_fw or $out_rev"
-        fi
+        echo "[`date`] skip_trimming; continuing with raw FASTQs"
+        # leave R1/R2 pointing at original RAW_R1/RAW_R2
+        R1="$RAW_R1"
+        R2="$RAW_R2"
 
       else
-        # decide if we need to run Trimmomatic
-        need_trim=false
-        if [[ ! -f "$out_fw" ]]; then
-          need_trim=true
-        elif [[ ! -f "$out_rev" ]]; then
-          need_trim=true
-        fi
+        # only run fastp if trimmed outputs do *not* exist
+        if [[ ! -f "$out_fw" ]] || [[ ! -f "$out_rev" ]]; then
+          conda activate ssuitslsu-fastp
+          echo "[`date`] Trimming reads for $sample with fastp"
+          fastp \
+            -i "$R1" -I "$R2" \
+            -o "$out_fw" -O "$out_rev" \
+            --unpaired1 "$un_fw" --unpaired2 "$un_rev" \
+            --detect_adapter_for_pe \
+            --cut_window_size 4 --cut_mean_quality 15 \
+            --trim_front1 10 \
+            --length_required 70 \
+            --thread "$THREADS" \
+            --html "$SAMPLE_DIR/${sample}_fastp.html" \
+            --json "$SAMPLE_DIR/${sample}_fastp.json"
 
-        if [[ "$need_trim" == "true" ]]; then
-          conda activate ssuitslsu-trimmomatic
-          # resolve adapter path
-          if [[ "$TRIMMOMATIC_ADAPTERS" == "auto" || -z "$TRIMMOMATIC_ADAPTERS" ]]; then
-            # this is where the adapters live in the activated env
-            ADAPTERS="$CONDA_PREFIX/share/trimmomatic/adapters/TruSeq2-PE.fa"
-          else
-            ADAPTERS="$TRIMMOMATIC_ADAPTERS"
-          fi
-          echo "[`date`] Trimming reads for $sample"
-          trimmomatic PE \
-            -threads "$THREADS" -phred33 \
-            "$R1" "$R2" \
-            "$out_fw" "$un_fw" \
-            "$out_rev" "$un_rev" \
-            ILLUMINACLIP:"$ADAPTERS:2:30:10" \
-            SLIDINGWINDOW:4:15 MINLEN:70 HEADCROP:10
+          # after trimming, point R1/R2 at the new files
+          R1="$out_fw"
+          R2="$out_rev"
+
         else
-          echo "[`date`] Skipping trimming (outputs exist)"
+          echo "[`date`] Skipping fastp (outputs exist)"
+          # point R1/R2 at existing trimmed files
+          R1="$out_fw"
+          R2="$out_rev"
         fi
       fi
+
       t_trim_end=$(date +%s)
-      R1="$out_fw"
-      R2="$out_rev"
 
       #init_p1=$(zgrep -c '^@' "$R1")
       #init_p2=$(zgrep -c '^@' "$R2")
@@ -518,7 +517,7 @@ for fp in "$READS_DIR"/*; do
             -2 "$P2" \
             --out-dir "$MH_DIR" \
             --num-cpu-threads "$THREADS" \
-            --min-contig-len 1000 \
+            --min-contig-len 400 \
             --memory "$MEM_GB" \
             --verbose \
             --keep-tmp-files
@@ -539,7 +538,7 @@ for fp in "$READS_DIR"/*; do
       t_asm_end=$(date +%s)
 
 
-            # ─── Assembly stats (contigs ≥1 kb) + 45S coverage ────────────────────────────────────
+      # ─── Assembly stats (contigs ≥1 kb) + 45S coverage ────────────────────────────────────
       CONTIG_DIR=$(dirname "$CONTIG")
       STATS_MINLEN=1000
       FILTERED_CONTIGS="${CONTIG_DIR}/contigs.${STATS_MINLEN}bp.fasta"
@@ -640,7 +639,6 @@ for fp in "$READS_DIR"/*; do
           ITSx -i "$FILTERED" \
                -o "${ITSX_DIR}/${sample}" \
                --preserve T \
-               --only_full T \
                --save_regions all \
                -t F \
                --region all \
@@ -656,78 +654,78 @@ for fp in "$READS_DIR"/*; do
       PHYLO_DIR="$SAMPLE_DIR/phylogeny"
       mkdir -p "$PHYLO_DIR"
 
-      # 0) pick the first ITSx output that exists
-      ITS_SRC=""
-      for region in full ITS1 ITS2; do
-        candidate="$ITSX_DIR/${sample}.${region}.fasta"
-        if [[ -s "$candidate" ]]; then
-          printf "[%s] Using ITSx %s for phylogeny\n" "$(date)" "$region"
-          ITS_SRC="$candidate"
-          break
+      # 1) Gather sample sequences: all ITSx regions + contigs ≥400 bp
+      SAMPLE_SEQ_FASTA="$PHYLO_DIR/${sample}_sequences.fasta"
+      : > "$SAMPLE_SEQ_FASTA"  # truncate/create
+
+      # a) ITSx outputs
+      for region in full ITS1 ITS2 SSU LSU 5_8S; do
+        src="$ITSX_DIR/${sample}.${region}.fasta"
+        if [[ -s "$src" ]]; then
+          printf "[%s] Adding ITSx %-4s → %s\n" "$(date)" "$region" "$src"
+          # prefix headers with sample and region
+          awk -v smp="$sample" -v rgn="$region" '
+            /^>/ { sub(/^>/, ">" smp "_" rgn "_"); print; next }
+            { print }
+          ' "$src" >> "$SAMPLE_SEQ_FASTA"
         fi
       done
 
-      if [[ -z "$ITS_SRC" ]]; then
-        printf "[%s] No ITSx output (full, ITS1 or ITS2); skipping phylogeny for %s\n\n" \
-               "$(date)" "$sample"
+      # b) assembled contigs ≥400 bp
+      printf "[%s] Adding contigs ≥400 bp from %s\n" "$(date)" "$CONTIG"
+      conda activate ssuitslsu-itsx
+      seqkit seq -m400 "$CONTIG" >> "$SAMPLE_SEQ_FASTA"
+
+      # 2) Build genus‐level reference
+      REF_GEN_FASTA="$PHYLO_DIR/${gen}_ref.fasta"
+      printf "[%s] Building genus reference for g__%s\n" "$(date)" "$gen"
+      awk -v tag="g__${gen}" '
+        BEGIN { RS=">"; ORS="" }
+        $0 ~ ("(^|;)" tag "(;|$)") { print ">" $0 }
+      ' "$REF_FASTA" > "$REF_GEN_FASTA"
+
+      # 3) Combine sample + reference into one FASTA
+      PHYLO_FASTA="$PHYLO_DIR/${gen}_phylo.fasta"
+      cat "$REF_GEN_FASTA" "$SAMPLE_SEQ_FASTA" > "$PHYLO_FASTA"
+      printf "[%s] Combined phylo FASTA: %s (%d refs + %d sample seqs)\n\n" \
+        "$(date)" "$PHYLO_FASTA" \
+        "$(grep -c '^>' "$REF_GEN_FASTA")" \
+        "$(grep -c '^>' "$SAMPLE_SEQ_FASTA")"
+
+      # 4) MAFFT alignment
+      PHYLO_ALN="$PHYLO_DIR/${gen}.aln"
+      if [[ -s "$PHYLO_ALN" ]]; then
+        printf "[%s] Skipping MAFFT (alignment exists): %s\n\n" "$(date)" "$PHYLO_ALN"
       else
-        # extract the original contig name
-        orig_node=$(grep -m1 '^>' "$ITS_SRC" | sed 's/^>//;s/ .*//')
-        orig_contig_fasta="$PHYLO_DIR/${sample}_${orig_node}.fasta"
-        awk -v node="$orig_node" '
-          BEGIN { RS=">"; ORS="" }
-          $1 == node { print ">" $0 }
-        ' "$CONTIG" > "$orig_contig_fasta"
-
-        # 1) Build genus‐level FASTA
-        GEN_FASTA="$PHYLO_DIR/${gen}.fasta"
-        printf "[%s] Building genus FASTA: %s\n" "$(date)" "$GEN_FASTA"
-        awk -v tag="g__${gen}" '
-          BEGIN { RS=">"; ORS="" }
-          $0 ~ ("(^|;)" tag "(;|$)") { print ">" $0 }
-        ' "$REF_FASTA" > "$GEN_FASTA"
-        # append our contig with sample tag
-        conda activate ssuitslsu-itsx
-        seqkit replace \
-          -p '^>(.+)' -r ">${sample}_\1" \
-          "$orig_contig_fasta" >> "$GEN_FASTA"
-
-        # 2) MAFFT alignment
-        PHYLO_ALN="$PHYLO_DIR/${gen}.aln"
-        if [[ -s "$PHYLO_ALN" ]]; then
-          printf "[%s] Skipping MAFFT (alignment exists): %s\n\n" "$(date)" "$PHYLO_ALN"
-        else
-          t_align_start=$(date +%s)
-          conda activate ssuitslsu-mafft
-          printf "[%s] Running MAFFT → %s\n" "$(date)" "$PHYLO_ALN"
-          mafft --thread "$THREADS" --auto "$GEN_FASTA" > "$PHYLO_ALN"
-          t_align_end=$(date +%s)
-          printf "\n"
-        fi
-
-        # 3) IQ-TREE ML inference
-        PHYLO_PREFIX="$PHYLO_DIR/${gen}"
-        TREEFILE="${PHYLO_PREFIX}.treefile"
-        if [[ -s "$TREEFILE" ]]; then
-          printf "[%s] Skipping IQ-TREE (tree exists): %s\n\n" "$(date)" "$TREEFILE"
-        else
-          t_phylo_start=$(date +%s)
-          conda activate ssuitslsu-iqtree
-          printf "[%s] Running IQ-TREE → prefix %s\n" "$(date)" "$PHYLO_PREFIX"
-          iqtree \
-            -s "$PHYLO_ALN" \
-            -m MFP \
-            -nt AUTO \
-            -ntmax "${THREADS}" \
-            -mem "${MEM_GB}G" \
-            -nt AUTO \
-            -bb 1000 \
-            -pre "$PHYLO_PREFIX"
-          t_phylo_end=$(date +%s)
-          printf "\n"
-        fi
+        t_align_start=$(date +%s)
+        conda activate ssuitslsu-mafft
+        printf "[%s] Running MAFFT → %s\n" "$(date)" "$PHYLO_ALN"
+        mafft --thread "$THREADS" --auto "$PHYLO_FASTA" > "$PHYLO_ALN"
+        t_align_end=$(date +%s)
+        printf "\n"
       fi
 
+      # 5) IQ-TREE ML inference
+      PHYLO_PREFIX="$PHYLO_DIR/${gen}"
+      TREEFILE="${PHYLO_PREFIX}.treefile"
+      if [[ -s "$TREEFILE" ]]; then
+        printf "[%s] Skipping IQ-TREE (tree exists): %s\n\n" "$(date)" "$TREEFILE"
+      else
+        t_phylo_start=$(date +%s)
+        conda activate ssuitslsu-iqtree
+        printf "[%s] Running IQ-TREE → prefix %s\n" "$(date)" "$PHYLO_PREFIX"
+        iqtree \
+          -s "$PHYLO_ALN" \
+          -m MFP \
+          -nt AUTO \
+          -ntmax "${THREADS}" \
+          -mem "${MEM_GB}G" \
+          -nt AUTO \
+          -bb 1000 \
+          -pre "$PHYLO_PREFIX"
+        t_phylo_end=$(date +%s)
+        printf "\n"
+      fi
 
       # ─── Timing & report ───────────────────────────────────────────────
       t1=$(date +%s)
