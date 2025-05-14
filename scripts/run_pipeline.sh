@@ -12,7 +12,7 @@ usage() {
 Usage: $(basename "$0") [OPTIONS]
 
 Options:
-  -n, --no-trim           Skip Trimmomatic trimming (use existing *_trimmed FASTQs)
+  -n, --no-trim           Skip fastp trimming
   -m, --max-memory MB     Override memory (GB) for SPAdes
   -t, --threads N         Override number of threads for all steps
   -h, --help              Show this help message and exit
@@ -56,9 +56,7 @@ REF_FASTA=$(shyaml get-value ref_fasta           < "$CONFIG")
 THREADS=$(shyaml get-value threads               < "$CONFIG")
 MEM_GB=$(shyaml get-value mem_gb                 < "$CONFIG")
 OUTDIR=$(shyaml get-value outdir                 < "$CONFIG")
-TRIMMOMATIC_ADAPTERS=$(shyaml get-value trimmomatic_adapters < "$CONFIG")
-# ensure it's never unset or empty
-TRIMMOMATIC_ADAPTERS=${TRIMMOMATIC_ADAPTERS:-auto}
+
 # new coverage thresholds (×)
 max_coverage=$(shyaml get-value max_coverage < "$CONFIG")
 target_coverage=$(shyaml get-value target_coverage < "$CONFIG")
@@ -67,7 +65,7 @@ max_coverage=${max_coverage:-100}
 target_coverage=${target_coverage:-90}
 
 # Strip stray quotes (so paths with spaces work)
-for var in READS_DIR TAXO_XLSX REF_FASTA TRIMMOMATIC_ADAPTERS; do
+for var in READS_DIR TAXO_XLSX REF_FASTA; do
   val="${!var}"
   val="${val#\"}"; val="${val%\"}"
   val="${val#\'}"; val="${val%\'}"
@@ -135,17 +133,11 @@ die(){ echo "ERROR: $*" >&2; exit 1; }
 [[ -f "$TAXO_XLSX" ]]  || die "taxonomy_file not found: $TAXO_XLSX"
 [[ -f "$REF_FASTA" ]]  || die "ref_fasta not found: $REF_FASTA"
 
-# trimmomatic adapters if not "auto"
-if [[ -n "$TRIMMOMATIC_ADAPTERS" && "$TRIMMOMATIC_ADAPTERS" != "auto" ]]; then
-  [[ -f "$TRIMMOMATIC_ADAPTERS" ]] \
-    || die "trimmomatic_adapters not found: $TRIMMOMATIC_ADAPTERS"
-fi
 
 echo "Running with:"
 echo "  skip_trimming    = $SKIP_TRIM"
 echo "  threads          = $THREADS"
 echo "  mem_gb           = $MEM_GB"
-echo "  adapters         = $TRIMMOMATIC_ADAPTERS"
 echo "  max_coverage     = ${max_coverage}×"
 echo "  target_coverage  = ${target_coverage}×"
 echo
