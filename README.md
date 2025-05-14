@@ -28,7 +28,7 @@ Extracts ribosomal small subunit (SSU), internal transcribed spacer (ITS), and l
    ```bash
    conda env create -f envs/utils.yaml
    conda env create -f envs/taxo.yaml
-   conda env create -f envs/trimmomatic.yaml
+   conda env create -f envs/fastp.yaml
    conda env create -f envs/mapping.yaml
    conda env create -f envs/spades.yaml
    conda env create -f envs/megahit.yaml
@@ -49,7 +49,6 @@ taxonomy_file: "/path/to/your_taxonomy.xlsx"  # BOLD format
 taxonomy_sheet: "Taxonomy"
 # ref_fasta is auto-downloaded if unset
 # ref_fasta: "/path/to/custom_reference.fasta"
-trimmomatic_adapters: auto  # auto‐located in the trimmomatic env
 tskip_trimming: false # true to use existing *_trimmed FASTQs
 auto_subsample: true       # always check coverage and subsample if needed
 max_coverage: 100          # threshold (×) above which to downsample
@@ -77,11 +76,11 @@ This will automatically:
 
 1. Download & filter the Eukaryome SSU+ITS+LSU reference (fungi-only).
 2. Convert your taxonomy spreadsheet (BOLD format) into a CSV.
-3. Trim reads with Trimmomatic (or skip if already trimmed).
+3. Trim reads with fastp (or skip if already trimmed).
 4. Map to the best‐matching reference and extract mapped reads.
 5. Assemble contigs with SPAdes or Megahit.
 6. Computes stats for contigs ≥ 1 kb
-7. Extract ITS regions with ITSx.
+7. Extract SSU, ITS and LSU regions with ITSx.
 8. Build per‐genus 45S FASTA sets, align with MAFFT, and infer ML trees with IQ-TREE.
 9. Provide per‐sample and per‐step timing breakdown.
 
