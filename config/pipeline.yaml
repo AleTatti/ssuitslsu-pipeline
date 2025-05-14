@@ -10,14 +10,13 @@ taxonomy_sheet:   "Taxonomy" #Taxonomy sheet of the spreadsheet
 # 3. Reference database (FASTA of SSU, ITS, LSU sequences) # ref_fasta is auto-downloaded if unset
 ref_fasta: "" 
 
-# 4. Path to Trimmomatic adapter file
-trimmomatic_adapters: auto # The pipeline will automatically locate the adapters in the ssuitslsu-trimmomatic Conda env
-skip_trimming:   false # if true, will *NOT* run Trimmomatic but use existing *_trimmed_1P/2P.fastq.gz
+# 4. Trimming
+skip_trimming:   false # if true, will *NOT* run fastp but use the input fastq
 
 # 5. coverage check
 auto_subsample: true       # always check coverage and subsample if needed
-max_coverage: 100          # threshold (×) above which to downsample
-target_coverage: 90        # aim (×) when subsampling
+max_coverage: 150          # threshold (×) above which to downsample
+target_coverage: 100        # aim (×) when subsampling
 
 # 6. Assembler
 assembler: spades    # change to "spades" to run SPAdes instead
