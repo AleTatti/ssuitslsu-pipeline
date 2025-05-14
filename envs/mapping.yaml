@@ -6,5 +6,4 @@ channels:
 dependencies:
   - bwa-mem2
   - samtools
-  - seqtk
   - bc
