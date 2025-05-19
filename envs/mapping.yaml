@@ -7,3 +7,5 @@ dependencies:
   - bwa-mem2
   - samtools
   - bc
+  - pysam
+  - python>=3.8

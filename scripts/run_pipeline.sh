@@ -56,6 +56,7 @@ REF_FASTA=$(shyaml get-value ref_fasta           < "$CONFIG")
 THREADS=$(shyaml get-value threads               < "$CONFIG")
 MEM_GB=$(shyaml get-value mem_gb                 < "$CONFIG")
 OUTDIR=$(shyaml get-value outdir                 < "$CONFIG")
+MAPQ=$(shyaml get-value mapq < "$CONFIG")
 
 # new coverage thresholds (×)
 max_coverage=$(shyaml get-value max_coverage < "$CONFIG")
@@ -63,6 +64,7 @@ target_coverage=$(shyaml get-value target_coverage < "$CONFIG")
 # fall back to defaults if not set in pipeline.yaml
 max_coverage=${max_coverage:-100}
 target_coverage=${target_coverage:-90}
+MAPQ=${MAPQ:-0}
 
 # Strip stray quotes (so paths with spaces work)
 for var in READS_DIR TAXO_XLSX REF_FASTA; do
@@ -140,6 +142,7 @@ echo "  threads          = $THREADS"
 echo "  mem_gb           = $MEM_GB"
 echo "  max_coverage     = ${max_coverage}×"
 echo "  target_coverage  = ${target_coverage}×"
+echo "  mapping quality treshold = ${MAPQ}"
 echo
 
 mkdir -p "$OUTDIR"
@@ -296,8 +299,8 @@ for fp in "$READS_DIR"/*; do
             -o "$out_fw" -O "$out_rev" \
             --unpaired1 "$un_fw" --unpaired2 "$un_rev" \
             --detect_adapter_for_pe \
-            --cut_window_size 4 --cut_mean_quality 15 \
-            --trim_front1 10 \
+            --cut_window_size 4 \
+            --cut_mean_quality 15 \
             --length_required 70 \
             --thread "$THREADS" \
             --html "$SAMPLE_DIR/${sample}_fastp.html" \
@@ -317,10 +320,6 @@ for fp in "$READS_DIR"/*; do
 
       t_trim_end=$(date +%s)
 
-      #init_p1=$(zgrep -c '^@' "$R1")
-      #init_p2=$(zgrep -c '^@' "$R2")
-      #echo "Initial trimmed: $init_p1 reads in R1, $init_p2 reads in R2"
-
 
       # ─── Mapping + auto‐subsampling ──────────────────────────────────────────────
       t_map_start=$(date +%s)
@@ -329,16 +328,19 @@ for fp in "$READS_DIR"/*; do
       sub2="$SAMPLE_DIR/${sample}.sub_2P.fastq.gz"
 
       conda activate ssuitslsu-mapping
+      # ensure we have a python binary to run our inline script
+      PYTHON_EXE="${CONDA_PREFIX}/bin/python"
+      [[ ! -x "$PYTHON_EXE" ]] && PYTHON_EXE=python
 
       # 1) initial mapping if needed
       if [[ ! -f "$BAM" ]]; then
         # build the index if needed
         [[ ! -f "${SAMPLE_REF}.bwt.2bit.64" ]] && bwa-mem2 index "$SAMPLE_REF"
 
-        echo "[$(date)] Mapping reads (MAPQ ≥ 30, properly paired only)"
+        echo "[$(date)] Mapping reads (MAPQ ≥ $MAPQ)"
         bwa-mem2 mem -v0 -t "$THREADS" "$SAMPLE_REF" "$R1" "$R2" \
           2> "$SAMPLE_DIR/mapping.log" \
-        | samtools view -b -q 30 -f 2 -F 4 -@ "$THREADS" \
+        | samtools view -b -@ "$THREADS" -F 4 -q "$MAPQ" \
         | samtools sort -@ "$THREADS" -o "$BAM"
 
         samtools index "$BAM"
@@ -350,58 +352,68 @@ for fp in "$READS_DIR"/*; do
       # fail early if no alignments
       [[ ! -s "$BAM" ]] && echo "!! Empty BAM; skipping sample" && continue 2
 
-      # 2) coverage check + optional subsampling
-      subbam="$SAMPLE_DIR/${sample}.subsampled.bam"
-      if [[ ! -f "$subbam" ]]; then
-        mean_cov=$(samtools depth -a "$BAM" \
+      # 2) coverage check + optional capping
+      subbam="${SAMPLE_DIR}/${sample}.depthcapped.bam"
+      if [[ ! -f "${subbam}" ]]; then
+        # compute mean coverage
+        mean_cov=$(samtools depth -a "${BAM}" \
                    | awk '{sum+=$3; cnt++} END {print (cnt? sum/cnt : 0)}')
-        printf "[%s] Mean coverage: %.1f×\n" "$(date)" "$mean_cov"
+        printf "[%s] Mean coverage: %.1f×\n" "$(date)" "${mean_cov}"
 
-        if (( $(echo "$mean_cov > $max_coverage" | bc -l) )); then
-          printf "[%s] Coverage > %d×, subsampling to ~%d×\n" \
-                 "$(date)" "$max_coverage" "$target_coverage"
+        if (( $(echo "${mean_cov} > ${max_coverage}" | bc -l) )); then
+          echo "[$(date)] Coverage ≥ ${max_coverage}×, downsampling to ${target_coverage}…"
 
-          frac=$(awk -v t="${target_coverage}" -v m="${mean_cov}" 'BEGIN{print t/m}')
+"${PYTHON_EXE}" <<PYCODE
+import pysam, random
 
-          # 1) subsample the mapped BAM
-          subbam="$SAMPLE_DIR/${sample}.subsampled.bam"
-          echo "[$(date)] Subsampling BAM to ~${target_coverage}× (frac=$frac)"
-          samtools view -b -@ "$THREADS" -s "$frac" "$BAM" > "$subbam"
-          samtools index "$subbam"
-          BAM="$subbam"
+IN_BAM  = "${BAM}"
+OUT_BAM = "${subbam}"
+TARGET  = ${target_coverage}
 
-          # 2) extract paired FASTQs in one go (no singleton file)
-          P1="$SAMPLE_DIR/${sample}.mapped_1.fastq.gz"
-          P2="$SAMPLE_DIR/${sample}.mapped_2.fastq.gz"
-          echo "[$(date)] Streaming collate→fastq from subsampled BAM"
-          rm -f "$P1" "$P2"
-          samtools view -h -@ "$THREADS" \
-              -b -f 2 \
-              -F 2304 \
-              -q 30 \
-              "$BAM" |
-          samtools collate -uO -@ "$THREADS" - |
-          samtools fastq -@ "$THREADS" \
-              -1 "$P1" \
-              -2 "$P2" \
-              -s /dev/null -
+# 1) Build a contig‐aware depth map
+depth = {}
+with pysam.AlignmentFile(IN_BAM, "rb") as bam:
+    for read in bam.fetch():
+        rname = read.reference_name
+        for pos in range(read.reference_start, read.reference_end):
+            depth[(rname, pos)] = depth.get((rname, pos), 0) + 1
 
-          # final sanity check
-          p1=$(zgrep -c '^@' "$P1")
-          p2=$(zgrep -c '^@' "$P2")
-          if [[ "$p1" -ne "$p2" ]]; then
-            echo "[ERROR] mate-pairs mismatch: R1=$p1 vs R2=$p2" >&2
-            exit 1
-          fi
-          echo "[$(date)] Extracted $p1 perfectly paired reads"
+# 2) Decide keep‐probability per read
+keep_names = set()
+with pysam.AlignmentFile(IN_BAM, "rb") as bam:
+    for read in bam.fetch():
+        rname = read.reference_name
+        # for each base, compute local “keep” ratio = min(1, TARGET/depth)
+        ratios = [
+            min(1.0, TARGET / depth[(rname, p)])
+            for p in range(read.reference_start, read.reference_end)
+        ]
+        # average ratio across the read = probability to KEEP it
+        p_keep = sum(ratios) / len(ratios)
+        if random.random() < p_keep:
+            keep_names.add(read.query_name)
+
+# 3) Write out exactly those reads
+with pysam.AlignmentFile(IN_BAM, "rb") as bam, \
+     pysam.AlignmentFile(OUT_BAM, "wb", template=bam) as out:
+    for read in bam.fetch():
+        if read.query_name in keep_names:
+            out.write(read)
+PYCODE
 
         else
-          echo "[$(date)] Coverage ≤ ${max_coverage}×; no subsampling"
+          echo "[$(date)] Coverage ≤ ${max_coverage}×; no downsampling (copying original)."
+          cp "${BAM}" "${subbam}"
         fi
+
+        samtools index "${subbam}"
+        BAM="${subbam}"
       else
-        echo "[$(date)] Subsampled BAM exists; skipping coverage check"
-        BAM="$subbam"
+        echo "[$(date)] Depth-capped BAM exists; skipping."
+        BAM="${subbam}"
       fi
+
+
 
       # ─── Extract mapped reads ─────────────────────────────────────────────────
       P1="$SAMPLE_DIR/${sample}.mapped_1.fastq.gz"
@@ -412,18 +424,16 @@ for fp in "$READS_DIR"/*; do
       if [[ ! -s "$P1" || ! -s "$P2" || "$BAM" -nt "$P1" || "$BAM" -nt "$P2" ]]; then
         echo "[$(date)] Extracting properly-paired primary alignments"
         rm -f "$P1" "$P2" "$U0"
-        # filter out secondary/supplementary, require proper-pair & MAPQ≥30,
-        # then fastq only R1/R2 (drop others into /dev/null)
         samtools view -h -@ "$THREADS" \
-          -b -f 2 \
-          -F 2304 \
-          -q 30 \
+          -b \
+          -F 4 \
+          -q "$MAPQ" \
           "$BAM" |
         samtools collate -uO -@ "$THREADS" - |
         samtools fastq -@ "$THREADS" \
           -1 "$P1" \
           -2 "$P2" \
-          -s /dev/null -
+          -s "$U0"
 
         # sanity check: ensure mate-pairs match
         p1=$(zgrep -c '^@' "$P1")
@@ -437,16 +447,6 @@ for fp in "$READS_DIR"/*; do
       else
         echo "[$(date)] Mapped FASTQs up-to-date; skipping extraction"
       fi
-
-      # Count *mapped* reads
-      #map_p1=$(zgrep -c '^@' "$P1")
-      #map_p2=$(zgrep -c '^@' "$P2")
-      #echo "Mapped reads:    $map_p1 reads in R1, $map_p2 reads in R2"
-
-      #mapping rates
-      #rate1=$(awk "BEGIN { printf \"%.2f\", ($map_p1/$init_p1)*100 }")
-      #rate2=$(awk "BEGIN { printf \"%.2f\", ($map_p2/$init_p2)*100 }")
-      #echo "Mapping rate:    R1: $rate1%   R2: $rate2%"
 
       t_map_end=$(date +%s)
 
@@ -463,23 +463,38 @@ for fp in "$READS_DIR"/*; do
         if [[ ! -f "$CONTIG" ]]; then
           conda activate ssuitslsu-spades
           echo "[`date`] Assembling with SPAdes"
+
+          # 1) clear any old run
+          rm -rf "$SP_DIR"
           mkdir -p "$SP_DIR"
 
-        # only pass -s if U0 actually has reads
-        if [[ -s "$U0" ]]; then
-          echo "→ Including $(zgrep -c '^@' "$U0") singletons"
-        else
-          echo "→ No singletons; not adding -s flag"
-          rm -f "$U0"
-        fi
-        cmd=(spades.py --careful \
-          -1 "$P1" -2 "$P2" \
-          -t "$THREADS" -m "$MEM_GB" \
-          -o "$SP_DIR")
-          [[ -s "$U0" ]] && cmd+=( -s "$U0" )
+          # 2) count true singletons and decide on the -s flag
+          if [[ -f "$U0" ]]; then
+            n0=$(zgrep -c '^@' "$U0" || echo 0)
+          else
+            n0=0
+          fi
+
+          if (( n0 > 0 )); then
+            echo "→ Including $n0 singletons"
+            SING_OPTS=(-s "$U0")
+          else
+            echo "→ No singletons; not adding -s"
+            SING_OPTS=()
+          fi
+
+          # 3) build and run the SPAdes command
+          cmd=(
+            spades.py --careful
+              -1 "$P1" -2 "$P2"
+              "${SING_OPTS[@]}"
+              -t "$THREADS" -m "$MEM_GB"
+              -o "$SP_DIR"
+          )
+
           "${cmd[@]}" 2>&1 | tee "$SP_DIR/spades.log"
         else
-          echo "[`date`] Skipping SPAdes assembly (exists)"
+          echo "[`date`] Skipping SPAdes assembly (found $CONTIG)"
         fi
 
       elif [[ "$ASSEMBLER" == "megahit" ]]; then
@@ -584,63 +599,79 @@ for fp in "$READS_DIR"/*; do
       t_its_start=$(date +%s)
       ITSX_DIR="${SAMPLE_DIR}/itsx"
       mkdir -p "$ITSX_DIR"
-      FULL_OUT="$ITSX_DIR/${sample}.full.fasta"
 
-      if [[ -s "$FULL_OUT" ]]; then
-        echo "[`date`] Skipping ITSx (found full region: $FULL_OUT)"
+      # define “done” markers so we don’t rerun completed branches
+      SMALL_DONE="$ITSX_DIR/${sample}.small.done"
+      LARGE_DONE="$ITSX_DIR/${sample}.large_nhmmer.done"
+
+      # if both are done, skip entire ITSx step
+      if [[ -f "$SMALL_DONE" && -f "$LARGE_DONE" ]]; then
+        echo "[`date`] Skipping ITSx on $sample (already completed both small & large runs)"
       else
         echo "[`date`] Preparing input for ITSx on $sample"
         conda activate ssuitslsu-itsx
 
-        # 1) chunk any contig >100 kb into ≤100 kb pieces
-        CHUNKS="$ITSX_DIR/contigs.chunks.fasta"
-        awk -v L=100000 '
+        # split contigs by length
+        SMALL_FASTA="$ITSX_DIR/${sample}.small.fasta"
+        LARGE_FASTA="$ITSX_DIR/${sample}.large.fasta"
+        : > "$SMALL_FASTA"
+        : > "$LARGE_FASTA"
+
+        awk -v L=100000 -v out_small="$SMALL_FASTA" -v out_large="$LARGE_FASTA" '
           BEGIN { RS=">"; ORS="" }
           NR>1 {
-            # separate header from sequence
             header = $1
-            seq = ""; 
-            # join all the rest of the lines into one long seq
-            for(i=2; i<=NF; i++) seq = seq $i
-            len = length(seq)
-
-            if (len > L) {
-              # how many pieces?
-              k = int((len - 1)/L) + 1
-              for (i = 0; i < k; i++) {
-                start = i*L + 1
-                printf(">%s_%03d\n%s\n", header, i+1, substr(seq, start, L))
-              }
+            seq = ""
+            for (i=2; i<=NF; i++) seq = seq $i
+            if (length(seq) > L) {
+              printf(">%s\n%s\n", header, seq) > out_large
             } else {
-              # just print the contig unchanged
-              printf(">%s\n%s\n", header, seq)
+              printf(">%s\n%s\n", header, seq) > out_small
             }
           }
-        ' "$CONTIG" > "$CHUNKS"
+        ' "$CONTIG"
 
-        # 2) filter out anything <200 bp
-        FILTERED="$ITSX_DIR/filtered.fasta"
-        seqkit seq -m200 "$CHUNKS" -o "$FILTERED"
-
-        # 3) if no fragments ≥200 bp, skip ITSx; otherwise run it
-        if [[ ! -s "$FILTERED" ]]; then
-          echo "[`date`] No fragments ≥200 bp after chunking; skipping ITSx for $sample"
-          touch "$ITSX_DIR/${sample}_no_detections.txt"
-        else
-          echo "[`date`] Running ITSx for $sample"
-          ITSx -i "$FILTERED" \
-               -o "${ITSX_DIR}/${sample}" \
+        # 1) run ITSx on the small contigs (default hmmsearch)
+        if [[ -s "$SMALL_FASTA" && ! -f "$SMALL_DONE" ]]; then
+          echo "[`date`] Running ITSx (hmmsearch) on small contigs for $sample"
+          ITSx -i "$SMALL_FASTA" \
+               -o "${ITSX_DIR}/${sample}.small" \
                --preserve T \
                --save_regions all \
-               -t F \
-               --region all \
                --anchor HMM \
-               --cpu "$THREADS"
+               --region all \
+               --cpu "$THREADS" \
+            && touch "$SMALL_DONE"
+        else
+          if [[ -f "$SMALL_DONE" ]]; then
+            echo "[`date`] Skipping small-contig ITSx (already done)"
+          else
+            echo "[`date`] No small contigs to process"
+          fi
+        fi
+
+        # 2) run ITSx on the large contigs (nhmmer)
+        if [[ -s "$LARGE_FASTA" && ! -f "$LARGE_DONE" ]]; then
+          echo "[`date`] Running ITSx (nhmmer) on large contigs for $sample"
+          ITSx -i "$LARGE_FASTA" \
+               -o "${ITSX_DIR}/${sample}.large_nhmmer" \
+               --preserve T \
+               --save_regions all \
+               --anchor HMM \
+               --region all \
+               --nhmmer T \
+               --cpu "$THREADS" \
+            && touch "$LARGE_DONE"
+        else
+          if [[ -f "$LARGE_DONE" ]]; then
+            echo "[`date`] Skipping large-contig ITSx (already done)"
+          else
+            echo "[`date`] No large contigs (>100 kb) to process"
+          fi
         fi
       fi
-      #               
-      t_its_end=$(date +%s)
 
+      t_its_end=$(date +%s)
 
       # ─── Phylogenetic analysis ────────────────────────────────────────────────
       PHYLO_DIR="$SAMPLE_DIR/phylogeny"
@@ -651,16 +682,19 @@ for fp in "$READS_DIR"/*; do
       : > "$SAMPLE_SEQ_FASTA"  # truncate/create
 
       # a) ITSx outputs
-      for region in full ITS1 ITS2 SSU LSU 5_8S; do
-        src="$ITSX_DIR/${sample}.${region}.fasta"
-        if [[ -s "$src" ]]; then
-          printf "[%s] Adding ITSx %-4s → %s\n" "$(date)" "$region" "$src"
-          # prefix headers with sample and region
-          awk -v smp="$sample" -v rgn="$region" '
-            /^>/ { sub(/^>/, ">" smp "_" rgn "_"); print; next }
-            { print }
-          ' "$src" >> "$SAMPLE_SEQ_FASTA"
-        fi
+      for size in small large_nhmmer; do
+        for region in full ITS1 ITS2 SSU LSU 5_8S; do
+          src="$ITSX_DIR/${sample}.${size}.${region}.fasta"
+          if [[ -s "$src" ]]; then
+            # log what we’re adding
+            printf "[%s] Adding ITSx %-4s (%s) → %s\n" "$(date)" "$region" "$size" "$src"
+            # prefix headers with sample, size, and region
+            awk -v smp="$sample" -v sz="$size" -v rgn="$region" '
+              /^>/ { sub(/^>/, ">" smp "_" sz "_" rgn "_"); print; next }
+              { print }
+            ' "$src" >> "$SAMPLE_SEQ_FASTA"
+          fi
+        done
       done
 
       # b) assembled contigs ≥400 bp
@@ -692,7 +726,7 @@ for fp in "$READS_DIR"/*; do
         t_align_start=$(date +%s)
         conda activate ssuitslsu-mafft
         printf "[%s] Running MAFFT → %s\n" "$(date)" "$PHYLO_ALN"
-        mafft --thread "$THREADS" --auto "$PHYLO_FASTA" > "$PHYLO_ALN"
+        mafft --thread "$THREADS" --auto --adjustdirection "$PHYLO_FASTA" > "$PHYLO_ALN"
         t_align_end=$(date +%s)
         printf "\n"
       fi
@@ -700,7 +734,7 @@ for fp in "$READS_DIR"/*; do
       # 5) IQ-TREE ML inference
       PHYLO_PREFIX="$PHYLO_DIR/${gen}"
       TREEFILE="${PHYLO_PREFIX}.treefile"
-      if [[ -s "$TREEFILE" ]]; then
+      if [[ -f "${PHYLO_PREFIX}.ckp.gz" ]]; then
         printf "[%s] Skipping IQ-TREE (tree exists): %s\n\n" "$(date)" "$TREEFILE"
       else
         t_phylo_start=$(date +%s)
