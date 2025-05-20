@@ -49,9 +49,9 @@ taxonomy_file: "/path/to/your_taxonomy.xlsx"  # BOLD format
 taxonomy_sheet: "Taxonomy"
 # ref_fasta is auto-downloaded if unset
 # ref_fasta: "/path/to/custom_reference.fasta"
-tskip_trimming: false # true to use existing *_trimmed FASTQs
+skip_trimming: false # true to use existing *_trimmed FASTQs
 auto_subsample: true       # always check coverage and subsample if needed
-max_coverage: 100          # threshold (×) above which to downsample
+max_coverage: 100          # treshold (×) above which to downsample
 target_coverage: 90        # aim (×) when subsampling
 assembler: spades           # or "megahit"
 threads: 8
@@ -83,6 +83,7 @@ This will automatically:
 7. Extract SSU, ITS and LSU regions with ITSx.
 8. Build per‐genus 45S FASTA sets, align with MAFFT, and infer ML trees with IQ-TREE.
 9. Provide per‐sample and per‐step timing breakdown.
+10. Writes all stdout/stderr via tee into ssuitslsu_YYYYMMDD_HHMMSS.log in the working directory
 
 ---
 
