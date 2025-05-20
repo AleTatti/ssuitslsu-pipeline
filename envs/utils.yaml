@@ -4,4 +4,4 @@ channels:
   - conda-forge
 dependencies:
   - shyaml
-  - yq            # (optional)
+  - python=3.9

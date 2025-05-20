@@ -1,5 +1,23 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Version checks
+echo "➤ Bash version: $BASH_VERSION"
+conda --version >/dev/null 2>&1 && echo "➤ Conda version: $(conda --version | cut -d' ' -f2)" \
+                             || echo "⚠️  conda not found in PATH"
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+export PYTHONUNBUFFERED=1
+
+# build your log‐filename
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG="ssuitslsu_${TIMESTAMP}.log"
+# redirect all stdout+stderr into tee, which writes to both console and log
+exec > >(tee -a "$LOG") 2>&1
+
 t_align_start=0
 t_align_end=0
 t_phylo_start=0
@@ -15,25 +33,39 @@ Options:
   -n, --no-trim           Skip fastp trimming
   -m, --max-memory MB     Override memory (GB) for SPAdes
   -t, --threads N         Override number of threads for all steps
+  -c, --config FILE       Pipeline config YAML (default: config/pipeline.yaml)
+      --assembler [spades|megahit]
+      --mapq N            Override mapping quality filter (samtools -q)
+      --outdir DIR        Override output directory
   -h, --help              Show this help message and exit
-  --assembler [spades|megahit]
 EOF
 }
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Default CLI overrides
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Initialize CLI-override vars with defaults
 SKIP_TRIM_CLI=false
 MEM_CLI=""
 THREADS_CLI=""
+CONFIG_CLI=""
+ASSEMBLER_CLI=""
+MAPQ_CLI=""
+OUTDIR_CLI=""
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 # Parse CLI args
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -h|--help)         usage; exit 0 ;;
+    -c|--config)       CONFIG_CLI="$2"; shift 2 ;;
     -n|--no-trim)      SKIP_TRIM_CLI=true; shift ;;
     -m|--max-memory)   MEM_CLI="$2"; shift 2 ;;
     -t|--threads)      THREADS_CLI="$2"; shift 2 ;;
-    -h|--help)         usage; exit 0 ;;
-    --assembler) ASSEMBLER="$2"; shift 2 ;;
+    --mapq)            MAPQ_CLI="$2"; shift 2 ;;
+    --assembler)       ASSEMBLER_CLI="$2"; shift 2 ;;
+    --outdir)          OUTDIR_CLI="$2"; shift 2 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
@@ -57,10 +89,20 @@ THREADS=$(shyaml get-value threads               < "$CONFIG")
 MEM_GB=$(shyaml get-value mem_gb                 < "$CONFIG")
 OUTDIR=$(shyaml get-value outdir                 < "$CONFIG")
 MAPQ=$(shyaml get-value mapq < "$CONFIG")
-
-# new coverage thresholds (×)
 max_coverage=$(shyaml get-value max_coverage < "$CONFIG")
 target_coverage=$(shyaml get-value target_coverage < "$CONFIG")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Apply CLI overrides (if provided)
+[[ -n "$CONFIG_CLI"     ]] && CONFIG="$CONFIG_CLI"
+[[ "$SKIP_TRIM_CLI" == true ]] && SKIP_TRIM=true
+[[ -n "$MEM_CLI"        ]] && MEM="$MEM_CLI"
+[[ -n "$THREADS_CLI"    ]] && THREADS="$THREADS_CLI"
+[[ -n "$ASSEMBLER_CLI"  ]] && ASSEMBLER="$ASSEMBLER_CLI"
+[[ -n "$MAPQ_CLI"       ]] && MAPQ="$MAPQ_CLI"
+[[ -n "$OUTDIR_CLI"     ]] && OUTDIR="$OUTDIR_CLI"
+# ──────────────────────────────────────────────────────────────────────────────
+
 # fall back to defaults if not set in pipeline.yaml
 max_coverage=${max_coverage:-100}
 target_coverage=${target_coverage:-90}
@@ -73,6 +115,8 @@ for var in READS_DIR TAXO_XLSX REF_FASTA; do
   val="${val#\'}"; val="${val%\'}"
   printf -v "$var" '%s' "$val"
 done
+
+echo "Starting ssuitslsu pipeline at $(date)"
 
 # ─── Download & build filtered reference if missing ─────────────────────────
 DATA_DIR="$(dirname "$0")/../data"
