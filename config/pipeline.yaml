@@ -20,7 +20,7 @@ target_coverage: 100       # aim (×) when subsampling (default: 90)
 mapq: 0                    # minimum mapping quality (default: 0)
 
 # 6. Assembler
-assembler: spades    # change to "spades" to run SPAdes instead
+assembler: spades    # change to "spades" to run SPAdes, or megahit to run MEGAHIT
 
 # 7. Computational resources
 threads: 8       # e.g. number of CPU cores to use
