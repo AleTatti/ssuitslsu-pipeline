@@ -48,12 +48,15 @@ Edit `config/pipeline.yaml` to point at your data and tweak parameters:
 reads_dir: "/path/to/raw_reads"
 taxonomy_file: "/path/to/your_taxonomy.xlsx"  # BOLD format
 taxonomy_sheet: "Taxonomy"
-# ref_fasta is auto-downloaded if unset
-# ref_fasta: "/path/to/custom_reference.fasta"
+ref_fasta: "/path/to/custom_reference.fasta" # ref_fasta is auto-downloaded if unset
 skip_trimming: false # true to use existing *_trimmed FASTQs
 auto_subsample: true       # always check coverage and subsample if needed
 max_coverage: 100          # treshold (×) above which to downsample
 target_coverage: 90        # aim (×) when subsampling
+mapq: 0   # minimum MAPQ to keep (samtools view -q)
+filter_softclipped_reads: false   # set to true to filter reads softclipped
+min_softclip_bases: 10       # threshold for softclip base count
+softclip_filter_mode: trim   # full = remove entire read, trim = remove softclip only
 assembler: spades           # or "megahit"
 threads: 8
 mem_gb: 16
