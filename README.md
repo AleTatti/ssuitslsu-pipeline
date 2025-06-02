@@ -1,5 +1,8 @@
 # ssuitslsu-pipeline
 
+> ⚠️ **Warning:** This pipeline is under active development.  
+> If you’ve cloned it previously, please run `git pull origin main` (or re‐clone) to get the latest changes before use.
+
 **SSU + ITS + LSU extraction**
 Extracts ribosomal small subunit (SSU), internal transcribed spacer (ITS), and large subunit (LSU) regions from fungal genome‐skimming data, assembles contigs, annotates ITS regions, builds per‐genus alignments and phylogenetic trees, and includes sliding‐window chimera detection.
 
