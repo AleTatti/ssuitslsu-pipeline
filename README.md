@@ -97,25 +97,24 @@ bash scripts/run_pipeline.sh
 Usage: run_pipeline.sh [OPTIONS]
 
 Options:
-  -n, --no-trim                  Skip fastp trimming (use existing FASTQs)
-  -m, --max-memory MB            Override memory (GB) for SPAdes/MEGAHIT
-  -t, --threads N                Override number of threads for all steps
-      --assembler [spades|megahit]  Choose assembler  
-      --mapq N                   Override mapping quality filter (samtools -q)
-      --filter-softclip          Enable soft-clip filtering of BAM
-      --min-softclip N           Override minimum soft-clip bases  
-      --softclip-mode MODE       Override soft-clip filter mode (full|trim)  
-      --auto-subsample [true|false]  Override auto_subsample behavior  
-      --max-cov N                Override max_coverage threshold  
-      --target-cov N             Override target_coverage threshold  
+  -n, --no-trim                     Skip fastp trimming (use existing FASTQs)
+  -m, --max-memory MB               Override memory (GB) for SPAdes/MEGAHIT
+  -t, --threads N                   Override number of threads for all steps
+      --assembler [spades|megahit]  Choose assembler (spades or megahit)
+      --mapq N                      Override mapping-quality filter (samtools -q)
+      --filter-softclip             Enable soft-clip filtering of BAM
+      --min-softclip N              Override minimum soft-clip bases
+      --softclip-mode MODE          Override soft-clip filter mode (full|trim)
+      --auto-subsample [true|false] Override auto_subsample behavior
+      --max-cov N                   Override max_coverage threshold
+      --target-cov N                Override target_coverage threshold
+      --reads-dir DIR               Specify directory containing raw read files
+      --taxonomy-file FILE          Path to taxonomy file (Excel .xlsx or .csv)
+      --taxonomy-sheet SHEET        Sheet name within taxonomy file
+      --ref-fasta FILE              Reference FASTA for mapping/indexing
+      --outdir DIR                  Override output directory
+  -h, --help                        Show this help message and exit
 
-      --reads-dir DIR            Specify directory containing raw read files  
-      --taxonomy-file FILE       Path to taxonomy file  
-      --taxonomy-sheet SHEET     Sheet name within taxonomy file  
-      --ref-fasta FILE           Reference FASTA for mapping/indexing  
-      --outdir DIR               Override output directory  
-
-  -h, --help                     Show this help message and exit
 
 
 ---
