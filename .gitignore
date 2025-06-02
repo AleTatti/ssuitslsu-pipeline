@@ -17,4 +17,6 @@ scripts/plain_pipe_slurm.sh
 scripts/run_slurm_all_samples.sh
 scripts/submit_jobs.sh
 
+config/pipeline copia.yaml
+
 .Rhistory
