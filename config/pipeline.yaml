@@ -4,7 +4,7 @@
 reads_dir: "/Users/utente/Desktop/PhD/Tuber/raw_reads"
 
 # 2. Taxonomy spreadsheet (Excel .xlsx or .csv BOLD format)
-taxonomy_file: "/Users/utente/Downloads/bold_taxonomy.xlsx"
+taxonomy_file: "/Users/utente/Desktop/PhD/BGE_ALPFUNGI/extract_ITS_pipeline/bold_taxonomy.xlsx"
 taxonomy_sheet:   "Taxonomy" #Taxonomy sheet of the spreadsheet
 
 # 3. Reference database (FASTA of SSU, ITS, LSU sequences) # ref_fasta is auto-downloaded if unset
@@ -22,7 +22,7 @@ mapq: 0                    # minimum mapping quality (default: 0)
 # 6. Assembler
 assembler: spades    # change to "spades" to run SPAdes, or megahit to run MEGAHIT
 
-# 7. Computational resources
+# 8. Computational resources
 threads: 8       # e.g. number of CPU cores to use
 mem_gb: 16       # e.g. total RAM in GB
 

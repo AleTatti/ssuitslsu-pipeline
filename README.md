@@ -1,7 +1,7 @@
 # ssuitslsu-pipeline
 
 **SSU + ITS + LSU extraction**
-Extracts ribosomal small subunit (SSU), internal transcribed spacer (ITS), and large subunit (LSU) regions from fungal genome‐skimming data, assembles contigs, annotates ITS regions, and builds per‐genus alignments and phylogenetic trees.
+Extracts ribosomal small subunit (SSU), internal transcribed spacer (ITS), and large subunit (LSU) regions from fungal genome‐skimming data, assembles contigs, annotates ITS regions, builds per‐genus alignments and phylogenetic trees, and includes sliding‐window chimera detection.
 
 ---
 
@@ -35,6 +35,7 @@ Extracts ribosomal small subunit (SSU), internal transcribed spacer (ITS), and l
    conda env create -f envs/itsx.yaml
    conda env create -f envs/mafft.yaml
    conda env create -f envs/iqtree.yaml
+   conda env create -f envs/chimera.yaml
    ```
 
 ---
@@ -72,18 +73,44 @@ Once your configuration is set, run:
 bash scripts/run_pipeline.sh
 ```
 
-This will automatically:
+1. This will automatically:
+2. Download & filter the fungal SSU+ITS+LSU reference.
+3. Convert your taxonomy sheet (BOLD format) into CSV.
+4. Trim reads with fastp (or skip if already trimmed).
+5. Map reads to the best‐matching reference—compute soft‐clip stats/filter if enabled, downsample by coverage, and extract mapped reads.
+6. Assemble contigs (SPAdes or MEGAHIT) and report stats for contigs ≥ 1 kb.
+7. Extract SSU, ITS, and LSU regions with ITSx (choosing HMMER vs. NHMMER based on contig length).
+8. Build per‐genus 45S FASTA sets, perform alignment trimming, and infer ML trees (MAFFT + IQ-TREE).
+9. Detect chimeras using a sliding p-distance scan (Python helper).
+10. Record per‐sample timings and send all output to ssuitslsu_YYYYMMDD_HHMMSS.log.
 
-1. Download & filter the Eukaryome SSU+ITS+LSU reference (fungi-only).
-2. Convert your taxonomy spreadsheet (BOLD format) into a CSV.
-3. Trim reads with fastp (or skip if already trimmed).
-4. Map to the best‐matching reference and extract mapped reads.
-5. Assemble contigs with SPAdes or Megahit.
-6. Computes stats for contigs ≥ 1 kb
-7. Extract SSU, ITS and LSU regions with ITSx.
-8. Build per‐genus 45S FASTA sets, align with MAFFT, and infer ML trees with IQ-TREE.
-9. Provide per‐sample and per‐step timing breakdown.
-10. Writes all stdout/stderr via tee into ssuitslsu_YYYYMMDD_HHMMSS.log in the working directory
+---
+
+## 🔧 CLI / Usage Options
+
+Usage: run_pipeline.sh [OPTIONS]
+
+Options:
+  -n, --no-trim                  Skip fastp trimming (use existing FASTQs)
+  -m, --max-memory MB            Override memory (GB) for SPAdes/MEGAHIT
+  -t, --threads N                Override number of threads for all steps
+      --assembler [spades|megahit]  Choose assembler  
+      --mapq N                   Override mapping quality filter (samtools -q)
+      --filter-softclip          Enable soft-clip filtering of BAM
+      --min-softclip N           Override minimum soft-clip bases  
+      --softclip-mode MODE       Override soft-clip filter mode (full|trim)  
+      --auto-subsample [true|false]  Override auto_subsample behavior  
+      --max-cov N                Override max_coverage threshold  
+      --target-cov N             Override target_coverage threshold  
+
+      --reads-dir DIR            Specify directory containing raw read files  
+      --taxonomy-file FILE       Path to taxonomy file  
+      --taxonomy-sheet SHEET     Sheet name within taxonomy file  
+      --ref-fasta FILE           Reference FASTA for mapping/indexing  
+      --outdir DIR               Override output directory  
+
+  -h, --help                     Show this help message and exit
+
 
 ---
 
@@ -92,25 +119,47 @@ This will automatically:
 ```
 results/
 └── <sample>/
-    ├── <sample>_trimmed_1P.fastq.gz
+    ├── <sample>_trimmed_1P.fastq.gz   # after fastp (if run)
     ├── <sample>_trimmed_2P.fastq.gz
-    ├── <sample>.sorted.bam
-    ├── <sample>.mapped_1.fastq.gz
+    ├── <sample>.sorted.bam             # mapped & subsampled (if applicable)
+    ├── <sample>.mapped_1.fastq.gz      # re-extracted paired mapped reads
     ├── <sample>.mapped_2.fastq.gz
+    ├── chimera/
+    │   ├── softclipped_reads/
+    │   │   ├── <sample>_softclip_stats.txt
+    │   │   ├── <sample>.softclipped.sam
+    │   │   ├── <sample>.softclipped.sorted.bam
+    │   ├── <sample>_chimera_report.tsv       # chimera detection report
+    │   ├── <sample>_chimera_plot.png         # pandas/Matplotlib figure
+    │   └── <sample>_chimera_report.html      # HTML summary
     ├── assembly/
-    │   ├── spades/      # contigs.fasta, scaffolds.fasta, spades.log
-    │   ├── megahit/     # final.contigs.fa, megahit.log
-    │   └── assembly_stats.1000bp.txt
+    │   ├── spades/        # contigs.fasta, scaffolds.fasta, spades.log  (if spades)
+    │   ├── megahit/       # final.contigs.fa, megahit.log             (if megahit)
+    │   └── assembly_stats.1000bp.txt   # stats for contigs ≥1 kb
     ├── itsx/
-    │   ├── <sample>.ITS1.fasta
-    │   ├── <sample>.5_8S.fasta
-    │   ├── <sample>.ITS2.fasta
-    │   └── <sample>.full.fasta
+    │   ├── <sample>.small.full.fasta         # from ITSx (small contigs)
+    │   ├── <sample>.small.SSU.fasta          # …
+    │   ├── <sample>.small.ITS1.fasta
+    │   ├── <sample>.small.5_8S.fasta
+    │   ├── <sample>.small.ITS2.fasta
+    │   ├── <sample>.small.LSU.fasta
+    │   ├── <sample>.large_nhmmer.full.fasta  # from ITSx (large contigs)
+    │   ├── <sample>.large_nhmmer.SSU.fasta
+    │   ├── <sample>.large_nhmmer.ITS1.fasta
+    │   ├── <sample>.large_nhmmer.5_8S.fasta
+    │   ├── <sample>.large_nhmmer.ITS2.fasta
+    │   └── <sample>.large_nhmmer.LSU.fasta
     └── phylogeny/
-        ├── <genus>.fasta       # FASTA of reference + sample contig
-        ├── <genus>.aln         # MAFFT alignment
-        ├── <genus>.treefile    # IQ-TREE tree
-        └── <genus>.log         # IQ-TREE run log
+        ├── <genus>_contigs.fasta   # merged contigs ≥400 bp & ITSx sequences
+        ├── <genus>_ITSx.fasta
+        ├── <genus>_sequences.fasta  # sample + reference
+        ├── <genus>_ref.fasta        # per-genus reference pulled from 45S DB
+        ├── <genus>_phylo.fasta      # concatenated FASTA (ref+sample)
+        ├── <genus>.aln              # MAFFT alignment (raw)
+        ├── <genus>.trimmed.aln      # trimmed alignment (head/tail removed)
+        ├── <genus>.treefile         # IQ-TREE ML tree
+        ├── <genus>.log              # IQ-TREE run log
+        └── <sample>_ITSx_coords_aln_trimmed.tsv  # mapping of raw→trimmed columns
 ```
 
 ---

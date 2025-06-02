@@ -1,0 +1,10 @@
+name: ssuitslsu-chimera
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - biopython>=1.79
+  - matplotlib>=3.5,<3.8
+  - numpy
