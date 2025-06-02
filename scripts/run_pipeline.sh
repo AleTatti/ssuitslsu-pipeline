@@ -88,6 +88,7 @@ REF_FASTA=$(shyaml get-value ref_fasta           < "$CONFIG")
 THREADS=$(shyaml get-value threads               < "$CONFIG")
 MEM_GB=$(shyaml get-value mem_gb                 < "$CONFIG")
 OUTDIR=$(shyaml get-value outdir                 < "$CONFIG")
+auto_subsample=$(shyaml get-value auto_subsample < "$CONFIG")
 MAPQ=$(shyaml get-value mapq < "$CONFIG")
 max_coverage=$(shyaml get-value max_coverage < "$CONFIG")
 target_coverage=$(shyaml get-value target_coverage < "$CONFIG")
@@ -104,6 +105,7 @@ target_coverage=$(shyaml get-value target_coverage < "$CONFIG")
 # ──────────────────────────────────────────────────────────────────────────────
 
 # fall back to defaults if not set in pipeline.yaml
+auto_subsample=${auto_subsample:-true}
 max_coverage=${max_coverage:-100}
 target_coverage=${target_coverage:-90}
 MAPQ=${MAPQ:-0}
@@ -184,6 +186,7 @@ echo "Running with:"
 echo "  skip_trimming    = $SKIP_TRIM"
 echo "  threads          = $THREADS"
 echo "  mem_gb           = $MEM_GB"
+echo "  auto_subsample   = $auto_subsample"
 echo "  max_coverage     = ${max_coverage}×"
 echo "  target_coverage  = ${target_coverage}×"
 echo "  mapping quality treshold = ${MAPQ}"
@@ -343,8 +346,6 @@ for fp in "$READS_DIR"/*; do
             -o "$out_fw" -O "$out_rev" \
             --unpaired1 "$un_fw" --unpaired2 "$un_rev" \
             --detect_adapter_for_pe \
-            --cut_window_size 4 \
-            --cut_mean_quality 15 \
             --length_required 70 \
             --thread "$THREADS" \
             --html "$SAMPLE_DIR/${sample}_fastp.html" \
@@ -399,13 +400,15 @@ for fp in "$READS_DIR"/*; do
       # 2) coverage check + optional capping
       subbam="${SAMPLE_DIR}/${sample}.depthcapped.bam"
       if [[ ! -f "${subbam}" ]]; then
-        # compute mean coverage
+        # Always compute and display mean coverage for reporting
         mean_cov=$(samtools depth -a "${BAM}" \
                    | awk '{sum+=$3; cnt++} END {print (cnt? sum/cnt : 0)}')
         printf "[%s] Mean coverage: %.1f×\n" "$(date)" "${mean_cov}"
 
-        if (( $(echo "${mean_cov} > ${max_coverage}" | bc -l) )); then
-          echo "[$(date)] Coverage ≥ ${max_coverage}×, downsampling to ${target_coverage}…"
+        # Check if auto_subsample is enabled
+        if [[ "$auto_subsample" == "true" ]]; then
+          if (( $(echo "${mean_cov} > ${max_coverage}" | bc -l) )); then
+            echo "[$(date)] auto_subsample=true: Coverage ≥ ${max_coverage}×, downsampling to ${target_coverage}…"
 
 "${PYTHON_EXE}" <<PYCODE
 import pysam, random
@@ -446,17 +449,20 @@ with pysam.AlignmentFile(IN_BAM, "rb") as bam, \
 PYCODE
 
         else
-          echo "[$(date)] Coverage ≤ ${max_coverage}×; no downsampling (copying original)."
+          echo "[$(date)] auto_subsample=true: Coverage ≤ ${max_coverage}×; no downsampling needed (copying original)."
           cp "${BAM}" "${subbam}"
         fi
-
-        samtools index "${subbam}"
-        BAM="${subbam}"
       else
-        echo "[$(date)] Depth-capped BAM exists; skipping."
-        BAM="${subbam}"
+        echo "[$(date)] auto_subsample=false: Skipping coverage-based downsampling (copying original)."
+        cp "${BAM}" "${subbam}"
       fi
 
+      samtools index "${subbam}"
+      BAM="${subbam}"
+    else
+      echo "[$(date)] Depth-capped BAM exists; skipping coverage analysis."
+      BAM="${subbam}"
+    fi
 
 
       # ─── Extract mapped reads ─────────────────────────────────────────────────
@@ -468,16 +474,23 @@ PYCODE
       if [[ ! -s "$P1" || ! -s "$P2" || "$BAM" -nt "$P1" || "$BAM" -nt "$P2" ]]; then
         echo "[$(date)] Extracting properly-paired primary alignments"
         rm -f "$P1" "$P2" "$U0"
+        
+        # Extract only properly paired reads to avoid mate-pair mismatches
         samtools view -h -@ "$THREADS" \
           -b \
-          -F 4 \
+          -f 1 -f 2 \
+          -F 4 -F 8 -F 256 -F 2048 \
           -q "$MAPQ" \
           "$BAM" |
         samtools collate -uO -@ "$THREADS" - |
         samtools fastq -@ "$THREADS" \
           -1 "$P1" \
           -2 "$P2" \
-          -s "$U0"
+          -0 /dev/null \
+          -s /dev/null
+
+        # Create empty singletons file for compatibility
+        touch "$U0"
 
         # sanity check: ensure mate-pairs match
         p1=$(zgrep -c '^@' "$P1")
