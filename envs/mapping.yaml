@@ -1,11 +1,16 @@
-# envs/mapping.yaml
+#mapping.yaml
 name: ssuitslsu-mapping
 channels:
-  - bioconda
   - conda-forge
+  - bioconda
+  - defaults
+channel_priority: strict
+
 dependencies:
-  - bwa-mem2
-  - samtools
-  - bc
-  - pysam
   - python=3.9
+  - bwa-mem2
+  - samtools=1.17
+  - bc
+  - pip
+  - pip:
+    - pysam==0.21.0

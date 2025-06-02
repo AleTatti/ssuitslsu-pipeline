@@ -7,4 +7,14 @@
 *.log
 *.DS_Store
 
+# Ignore bamUtil and libStatGen folders
+bamUtil/
+libStatGen/
+
+# Ignore all legacy run_pipeline scripts
+scripts/run_pipeline*.sh
+scripts/plain_pipe_slurm.sh
+scripts/run_slurm_all_samples.sh
+scripts/submit_jobs.sh
+
 .Rhistory
