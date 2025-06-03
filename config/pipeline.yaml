@@ -22,9 +22,14 @@ mapq: 0                    # minimum mapping quality (default: 0)
 # 6. Assembler
 assembler: spades    # change to "spades" to run SPAdes, or "megahit" to run MEGAHIT
 
+# 7. Soft-clipped read filtering
+filter_softclipped_reads: false
+min_softclip_bases: 20
+softclip_filter_mode: trim  # or "full"
+
 # 8. Computational resources
 threads: 8       # e.g. number of CPU cores to use
 mem_gb: 16       # e.g. total RAM in GB
 
-# 8. Where to put all output
+# 9. Where to put all output
 outdir: "results"
