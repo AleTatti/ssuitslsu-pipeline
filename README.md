@@ -68,15 +68,12 @@ min_softclip_bases: 10             # Minimum number of soft-clipped bases to tri
 softclip_filter_mode: trim         # Options: "full" (remove entire read) or "trim" (trim softclipped ends only)
 # Assembly
 assembler: spades           # Options: "spades" or "megahit"
-# Computational resources
+# Computational resources that controls CPU and RAM for mapping, assembly, alignment, and tree building.
 threads: 8                  # Number of threads to use
 mem_gb: 16                  # Total RAM in GB
 # Output
 outdir: "results"
 ```
-
-* **skip\_trimming**: set to `true` to use existing `*_trimmed` FASTQs.
-* **threads / mem\_gb**: controls CPU and RAM for mapping, assembly, alignment, and tree building.
 
 ---
 
