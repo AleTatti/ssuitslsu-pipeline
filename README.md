@@ -49,20 +49,29 @@ Edit `config/pipeline.yaml` to point at your data and tweak parameters:
 
 ```yaml
 reads_dir: "/path/to/raw_reads"
-taxonomy_file: "/path/to/your_taxonomy.xlsx"  # BOLD format
+# Taxonomy file (Excel or CSV in BOLD format)
+taxonomy_file: "/path/to/your_taxonomy.xlsx"
 taxonomy_sheet: "Taxonomy"
-ref_fasta: "/path/to/custom_reference.fasta" # ref_fasta is auto-downloaded if unset
-skip_trimming: false # true to use existing *_trimmed FASTQs
-auto_subsample: true       # always check coverage and subsample if needed
-max_coverage: 100          # treshold (×) above which to downsample
-target_coverage: 90        # aim (×) when subsampling
-mapq: 0   # minimum MAPQ to keep (samtools view -q)
-filter_softclipped_reads: false   # set to true to filter reads softclipped
-min_softclip_bases: 10       # threshold for softclip base count
-softclip_filter_mode: trim   # full = remove entire read, trim = remove softclip only
-assembler: spades           # or "megahit"
-threads: 8
-mem_gb: 16
+# Reference FASTA (optional; auto-downloaded if empty)
+ref_fasta: "/path/to/custom_reference.fasta"
+# Trimming
+skip_trimming: false  # Set to true to skip fastp and use existing *_trimmed FASTQs
+# Coverage-based downsampling
+auto_subsample: true         # Enable automatic coverage check and downsampling
+max_coverage: 100            # Threshold (×) above which to downsample
+target_coverage: 90          # Target (×) coverage after subsampling
+# Mapping quality filtering
+mapq: 0                      # Minimum MAPQ to retain alignments (samtools -q)
+# Soft-clipped read filtering
+filter_softclipped_reads: false    # Enable filtering of soft-clipped reads
+min_softclip_bases: 10             # Minimum number of soft-clipped bases to trigger filtering
+softclip_filter_mode: trim         # Options: "full" (remove entire read) or "trim" (trim softclipped ends only)
+# Assembly
+assembler: spades           # Options: "spades" or "megahit"
+# Computational resources
+threads: 8                  # Number of threads to use
+mem_gb: 16                  # Total RAM in GB
+# Output
 outdir: "results"
 ```
 
