@@ -30,29 +30,46 @@ usage() {
 Usage: $(basename "$0") [OPTIONS]
 
 Options:
-  -n, --no-trim           Skip fastp trimming
-  -m, --max-memory MB     Override memory (GB) for SPAdes
-  -t, --threads N         Override number of threads for all steps
-  -c, --config FILE       Pipeline config YAML (default: config/pipeline.yaml)
+  -n, --no-trim             Skip fastp trimming
+  -m, --max-memory MB       Override memory (GB) for SPAdes
+  -t, --threads N           Override number of threads for all steps
       --assembler [spades|megahit]
-      --mapq N            Override mapping quality filter (samtools -q)
-      --outdir DIR        Override output directory
-  -h, --help              Show this help message and exit
+                            Choose assembler (spades or megahit)
+      --mapq N              Override mapping quality filter (samtools -q)
+      --outdir DIR          Override output directory
+      --reads-dir DIR       Specify directory containing raw read files
+      --taxonomy-file FILE  Path to taxonomy file
+      --taxonomy-sheet SHEET
+                            Sheet name within the taxonomy file
+      --ref-fasta FILE      Reference FASTA for mapping/indexing
+      --filter-softclip     Enable filtering of soft‐clipped reads
+      --min-softclip N        Override minimum soft-clip bases
+      --softclip-mode MODE    Override soft-clip filter mode (full|trim)
+      --auto-subsample [true|false] Override auto_subsample behavior
+      --max-cov N             Override max_coverage threshold
+      --target-cov N          Override target_coverage threshold
+
+  -h, --help                Show this help message and exit
 EOF
 }
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Initialize CLI-override vars with defaults
 SKIP_TRIM_CLI=false
-MEM_CLI=""
+SKIP_TRIM=false
+MEM=""
 THREADS_CLI=""
-CONFIG_CLI=""
 ASSEMBLER_CLI=""
 MAPQ_CLI=""
-FILTER_SOFTCLIP=false
+FILTER_SOFTCLIP_CLI=""
 OUTDIR_CLI=""
+READS_DIR_CLI=""
+TAXONOMY_FILE_CLI=""
+TAXONOMY_SHEET_CLI=""
+REF_FASTA_CLI=""
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -60,14 +77,23 @@ OUTDIR_CLI=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)         usage; exit 0 ;;
-    -c|--config)       CONFIG_CLI="$2"; shift 2 ;;
+    --reads-dir)       READS_DIR_CLI="$2"; shift 2 ;;
+    --taxonomy-file)   TAXONOMY_FILE_CLI="$2"; shift 2 ;;
+    --taxonomy-sheet)  TAXONOMY_SHEET_CLI="$2"; shift 2 ;;
+    --ref-fasta)       REF_FASTA_CLI="$2"; shift 2 ;;
     -n|--no-trim)      SKIP_TRIM_CLI=true; shift ;;
     -m|--max-memory)   MEM_CLI="$2"; shift 2 ;;
     -t|--threads)      THREADS_CLI="$2"; shift 2 ;;
     --mapq)            MAPQ_CLI="$2"; shift 2 ;;
-    --filter-softclip) FILTER_SOFTCLIP=true; shift ;;
+    --filter-softclip) FILTER_SOFTCLIP_CLI=true; shift ;;
     --assembler)       ASSEMBLER_CLI="$2"; shift 2 ;;
     --outdir)          OUTDIR_CLI="$2"; shift 2 ;;
+    --min-softclip)    MIN_SOFTCLIP_CLI="$2";      shift 2 ;;
+    --softclip-mode)   SOFTCLIP_MODE_CLI="$2";     shift 2 ;;
+    --auto-subsample)  AUTO_SUBSAMPLE_CLI="$2";    shift 2 ;;
+    --max-cov)         MAX_COV_CLI="$2";          shift 2 ;;
+    --target-cov)      TARGET_COV_CLI="$2";       shift 2 ;;
+
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
@@ -83,46 +109,84 @@ conda activate ssuitslsu-utils
 
 # 2) Load config
 CONFIG="$(dirname "$0")/../config/pipeline.yaml"
-READS_DIR=$(shyaml get-value reads_dir           < "$CONFIG")
-TAXO_XLSX=$(shyaml get-value taxonomy_file       < "$CONFIG")
-TAXO_SHEET=$(shyaml get-value taxonomy_sheet     < "$CONFIG")
-REF_FASTA=$(shyaml get-value ref_fasta           < "$CONFIG")
-THREADS=$(shyaml get-value threads               < "$CONFIG")
-MEM_GB=$(shyaml get-value mem_gb                 < "$CONFIG")
-OUTDIR=$(shyaml get-value outdir                 < "$CONFIG")
-auto_subsample=$(shyaml get-value auto_subsample < "$CONFIG")
-MAPQ=$(shyaml get-value mapq < "$CONFIG")
-FILTER_SOFTCLIP=$(shyaml get-value filter_softclipped_reads < "$CONFIG")
-MIN_SOFTCLIP_BASES=$(shyaml get-value min_softclip_bases < "$CONFIG")
-SOFTCLIP_FILTER_MODE=$(shyaml get-value softclip_filter_mode < "$CONFIG")
-max_coverage=$(shyaml get-value max_coverage < "$CONFIG")
-target_coverage=$(shyaml get-value target_coverage < "$CONFIG")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Apply CLI overrides (if provided)
-[[ -n "$CONFIG_CLI"     ]] && CONFIG="$CONFIG_CLI"
-[[ "$SKIP_TRIM_CLI" == true ]] && SKIP_TRIM=true
-[[ -n "$MEM_CLI"        ]] && MEM="$MEM_CLI"
-[[ -n "$THREADS_CLI"    ]] && THREADS="$THREADS_CLI"
-[[ -n "$ASSEMBLER_CLI"  ]] && ASSEMBLER="$ASSEMBLER_CLI"
-[[ -n "$MAPQ_CLI"       ]] && MAPQ="$MAPQ_CLI"
-[[ "$FILTER_SOFTCLIP" == true || "$FILTER_SOFTCLIP" == "true" ]] && FILTER_SOFTCLIP=true
-[[ -n "$OUTDIR_CLI"     ]] && OUTDIR="$OUTDIR_CLI"
+READS_DIR=$(shyaml get-value reads_dir              < "$CONFIG")
+TAXONOMY_FILE=$(shyaml get-value taxonomy_file      < "$CONFIG")
+TAXONOMY_SHEET=$(shyaml get-value taxonomy_sheet    < "$CONFIG")
+REF_FASTA=$(shyaml get-value ref_fasta              < "$CONFIG")
+
+# trimming
+SKIP_TRIM_RAW=$(shyaml get-value skip_trimming < "$CONFIG")
+
+# mapping/filtering
+MAPQ=$(shyaml get-value mapq                        < "$CONFIG")
+FILTER_SOFTCLIP_RAW=$(shyaml get-value filter_softclipped_reads < "$CONFIG")
+MIN_SOFTCLIP=$(shyaml get-value min_softclip_bases  < "$CONFIG")
+SOFTCLIP_MODE=$(shyaml get-value softclip_filter_mode < "$CONFIG")
+
+# coverage
+AUTO_SUBSAMPLE_RAW=$(shyaml get-value auto_subsample    < "$CONFIG")
+MAX_COV=$(shyaml get-value max_coverage             < "$CONFIG")
+TARGET_COV=$(shyaml get-value target_coverage       < "$CONFIG")
+
+# assembly
+ASSEMBLER=$(shyaml get-value assembler              < "$CONFIG")
+
+# resources
+THREADS=$(shyaml get-value threads                  < "$CONFIG")
+MEM=$(shyaml get-value mem_gb                       < "$CONFIG")
+
+# output
+OUTDIR=$(shyaml get-value outdir                    < "$CONFIG")  
+
+
+SKIP_TRIM="${SKIP_TRIM_RAW,,}"
+ASSEMBLER="${ASSEMBLER,,}"
+FILTER_SOFTCLIP="${FILTER_SOFTCLIP_RAW,,}"
+SOFTCLIP_MODE="${SOFTCLIP_MODE,,}"
+AUTO_SUBSAMPLE="${AUTO_SUBSAMPLE_RAW,,}"
+
+# ─── Apply CLI overrides (if provided) ────────────────────────────────────────
+[[ -n "${READS_DIR_CLI:-}"      ]] && READS_DIR="$READS_DIR_CLI"
+[[ -n "${TAXONOMY_FILE_CLI:-}"  ]] && TAXONOMY_FILE="$TAXONOMY_FILE_CLI"
+[[ -n "${TAXONOMY_SHEET_CLI:-}" ]] && TAXONOMY_SHEET="$TAXONOMY_SHEET_CLI"
+[[ -n "${REF_FASTA_CLI:-}"      ]] && REF_FASTA="$REF_FASTA_CLI"
+
+[[ "${SKIP_TRIM_CLI:-}" == "true" ]] && SKIP_TRIM=true
+
+[[ -n "${MAPQ_CLI:-}"           ]] && MAPQ="$MAPQ_CLI"
+[[ -n "${FILTER_SOFTCLIP_CLI:-}" ]] && FILTER_SOFTCLIP="$FILTER_SOFTCLIP_CLI"
+[[ -n "${MIN_SOFTCLIP_CLI:-}"   ]] && MIN_SOFTCLIP="$MIN_SOFTCLIP_CLI"
+[[ -n "${SOFTCLIP_MODE_CLI:-}"  ]] && SOFTCLIP_MODE="$SOFTCLIP_MODE_CLI"
+
+[[ -n "${AUTO_SUBSAMPLE_CLI:-}" ]] && AUTO_SUBSAMPLE="$AUTO_SUBSAMPLE_CLI"
+[[ -n "${MAX_COV_CLI:-}"        ]] && MAX_COV="$MAX_COV_CLI"
+[[ -n "${TARGET_COV_CLI:-}"     ]] && TARGET_COV="$TARGET_COV_CLI"
+
+[[ -n "${ASSEMBLER_CLI:-}"      ]] && ASSEMBLER="$ASSEMBLER_CLI"
+
+[[ -n "${THREADS_CLI:-}"        ]] && THREADS="$THREADS_CLI"
+[[ -n "${MEM_CLI:-}"            ]] && MEM="$MEM_CLI"
+
+[[ -n "${OUTDIR_CLI:-}"         ]] && OUTDIR="$OUTDIR_CLI"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 # fall back to defaults if not set in pipeline.yaml
-auto_subsample=${auto_subsample:-true}
-max_coverage=${max_coverage:-100}
-target_coverage=${target_coverage:-90}
+MAX_COV=${MAX_COV:-100}
+TARGET_COV=${TARGET_COV:-90}
 MAPQ=${MAPQ:-0}
+AUTO_SUBSAMPLE=${AUTO_SUBSAMPLE:-true}
 
 # Strip stray quotes (so paths with spaces work)
-for var in READS_DIR TAXO_XLSX REF_FASTA; do
-  val="${!var}"
+for var in READS_DIR TAXONOMY_FILE REF_FASTA; do
+  val="${!var:-}"
   val="${val#\"}"; val="${val%\"}"
   val="${val#\'}"; val="${val%\'}"
   printf -v "$var" '%s' "$val"
 done
+
 
 echo "Starting ssuitslsu pipeline at $(date)"
 
@@ -161,16 +225,6 @@ else
   echo "[$(date)] Using auto-downloaded reference: $REF_FASTA"
 fi
 
-
-# Apply CLI overrides
-if [[ "$SKIP_TRIM_CLI" == true ]]; then
-  SKIP_TRIM=true
-else
-  SKIP_TRIM=$(shyaml get-value skip_trimming < "$CONFIG")
-fi
-[[ -n "$MEM_CLI"     ]] && MEM_GB="$MEM_CLI"
-[[ -n "$THREADS_CLI" ]] && THREADS="$THREADS_CLI"
-
 # ─── Assembler default & validation ────────────────────────────────────────
 ASSEMBLER=${ASSEMBLER:-$(shyaml get-value assembler < "$CONFIG")}
 
@@ -184,31 +238,30 @@ die(){ echo "ERROR: $*" >&2; exit 1; }
 
 # ensure reads / taxonomy / reference exist
 [[ -d "$READS_DIR" ]]  || die "reads_dir not found: $READS_DIR"
-[[ -f "$TAXO_XLSX" ]]  || die "taxonomy_file not found: $TAXO_XLSX"
+[[ -f "$TAXONOMY_FILE" ]] || die "taxonomy file not found: $TAXONOMY_FILE"
 [[ -f "$REF_FASTA" ]]  || die "ref_fasta not found: $REF_FASTA"
 
 
 echo "Running with:"
 echo "  skip_trimming    = $SKIP_TRIM"
 echo "  threads          = $THREADS"
-echo "  mem_gb           = $MEM_GB"
-echo "  auto_subsample   = $auto_subsample"
-echo "  max_coverage     = ${max_coverage}×"
-echo "  target_coverage  = ${target_coverage}×"
+echo "  mem_gb           = $MEM"
+echo "  max_coverage     = ${MAX_COV}×"
+echo "  target_coverage  = ${TARGET_COV}×"
 echo "  mapping quality treshold = ${MAPQ}"
 echo "  filter_softclipped_reads = $FILTER_SOFTCLIP"
-if [[ "$FILTER_SOFTCLIP" == true ]]; then
-  echo "  min_softclip_bases       = $MIN_SOFTCLIP_BASES"
-  echo "  softclip_filter_mode     = $SOFTCLIP_FILTER_MODE"
+if [[ $FILTER_SOFTCLIP == true ]]; then
+  echo "  min_softclip_bases       = $MIN_SOFTCLIP"
+  echo "  softclip_filter_mode     = $SOFTCLIP_MODE"
 fi
 
 echo
 
 mkdir -p "$OUTDIR"
-TAX_CSV="$OUTDIR/$(basename "${TAXO_XLSX%.*}").csv"
+TAX_CSV="$OUTDIR/$(basename "${TAXONOMY_FILE%.*}").csv"
 
 # 4) Taxonomy conversion (auto-detect sheet & header) #only once
-if [[ ! -f "$TAX_CSV" || "$TAXO_XLSX" -nt "$TAX_CSV" ]]; then
+if [[ ! -f "$TAX_CSV" || "$TAXONOMY_FILE" -nt "$TAX_CSV" ]]; then
   conda activate ssuitslsu-taxo
   echo "[`date`] Converting taxonomy → CSV"
  PYTHON_EXE="$CONDA_PREFIX/bin/python"
@@ -217,9 +270,9 @@ if [[ ! -f "$TAX_CSV" || "$TAXO_XLSX" -nt "$TAX_CSV" ]]; then
   "$PYTHON_EXE" <<PYCODE
 import sys, os, pandas as pd
 
-tax_file   = "${TAXO_XLSX}"
+tax_file   = "${TAXONOMY_FILE}"
 out_csv    = "${TAX_CSV}"
-requested  = "${TAXO_SHEET}"
+requested  = "${TAXONOMY_SHEET}"
 wanted     = [
   'Sample ID','Phylum','Class','Order',
   'Family','Subfamily','Tribe',
@@ -409,22 +462,22 @@ for fp in "$READS_DIR"/*; do
       # fail early if no alignments
       [[ ! -s "$BAM" ]] && echo "!! Empty BAM; skipping sample" && continue 2
 
-      # ─── Soft‑clip statistics and optional filtering ─────────────────────
+      # ─── Soft-clip statistics and optional filtering ─────────────────────
       SC_DIR="$SAMPLE_DIR/chimera/softclipped_reads"
       mkdir -p "$SC_DIR"
       STAT_FILE="$SC_DIR/${sample}_softclip_stats.txt"
 
       # If stats file already exists, skip recomputing
       if [[ -f "$STAT_FILE" ]]; then
-        echo "[$(date)] Soft‑clip stats already present; skipping computation"
+        echo "[$(date)] Soft-clip stats already present; skipping computation"
       else
-        echo "[$(date)] Computing soft‑clip statistics (min=${MIN_SOFTCLIP_BASES}, mode=${SOFTCLIP_FILTER_MODE})" | tee "$STAT_FILE"
+        echo "[$(date)] Computing soft-clip statistics (min=${MIN_SOFTCLIP}, mode=${SOFTCLIP_MODE})" | tee "$STAT_FILE"
 
         total_reads=$(samtools view "$BAM" | wc -l)
         echo "Total mapped reads: $total_reads" | tee -a "$STAT_FILE"
 
         softclip_reads=$(samtools view "$BAM" | \
-          awk -v min="$MIN_SOFTCLIP_BASES" '
+          awk -v min="$MIN_SOFTCLIP" '
             {
               cigar = $6
               while (match(cigar, /[0-9]+S/)) {
@@ -437,10 +490,10 @@ for fp in "$READS_DIR"/*; do
         pct=$(awk -v s="$softclip_reads" -v t="$total_reads" \
               'BEGIN{ if (t>0) printf("%.2f", s*100/t); else print "0.00" }')
 
-        echo "Reads with ≥${MIN_SOFTCLIP_BASES} soft‑clipped bases: $softclip_reads ($pct%)" | tee -a "$STAT_FILE"
+        echo "Reads with ≥${MIN_SOFTCLIP} soft-clipped bases: $softclip_reads ($pct%)" | tee -a "$STAT_FILE"
       fi
 
-      # Create a BAM of only the soft‑clipped reads for IGV (once)
+      # Create a BAM of only the soft-clipped reads for IGV (once)
       if [[ ! -f "$SC_DIR/${sample}.softclipped.sorted.bam" ]]; then
         samtools view -H "$BAM" > "$SC_DIR/${sample}.softclipped_header.sam"
         cat "$SC_DIR/${sample}.softclipped_header.sam" "$SC_DIR/${sample}.softclipped.sam" \
@@ -450,13 +503,13 @@ for fp in "$READS_DIR"/*; do
       fi
 
       # If filtering is enabled, either remove entire reads or trim the ends
-      if [[ "$FILTER_SOFTCLIP" == true ]]; then
+      if [[ $FILTER_SOFTCLIP == true ]]; then
 
-        if [[ "$SOFTCLIP_FILTER_MODE" == "full" ]]; then
-          echo "[$(date)] Removing entire reads with ≥${MIN_SOFTCLIP_BASES} soft‑clipped bases…"
+        if [[ "$SOFTCLIP_MODE" == "full" ]]; then
+          echo "[$(date)] Removing entire reads with ≥${MIN_SOFTCLIP} soft-clipped bases…"
           BAM_FILTERED="$SAMPLE_DIR/${sample}.filtered.softclip.bam"
           samtools view -h "$BAM" \
-            | awk -v min="$MIN_SOFTCLIP_BASES" 'BEGIN{OFS="\t"}
+            | awk -v min="$MIN_SOFTCLIP" 'BEGIN{OFS="\t"}
                 /^@/ { print; next }
                 {
                   cigar = $6; keep = 1
@@ -470,18 +523,24 @@ for fp in "$READS_DIR"/*; do
             | samtools view -bS -o "$BAM_FILTERED"
           samtools index "$BAM_FILTERED"
           BAM="$BAM_FILTERED"
-          echo "[$(date)] Updated BAM with soft‑clipped reads removed: $BAM"
+          echo "[$(date)] Updated BAM with soft-clipped reads removed: $BAM"
 
-        elif [[ "$SOFTCLIP_FILTER_MODE" == "trim" ]]; then
-          echo "[$(date)] Trimming soft‑clipped bases from read ends…"
-          TRIM_BAM="$SAMPLE_DIR/${sample}.trimmed_softclip.bam"
+        elif [[ "$SOFTCLIP_MODE" == "trim" ]]; then
+          # define unsorted & sorted filenames
+          TRIM_BAM_UNSORTED="$SAMPLE_DIR/${sample}.trimmed_softclip.bam"
+          TRIM_BAM_SORTED="${TRIM_BAM_UNSORTED%.bam}.sorted.bam"
 
-    python <<PYCODE
+          # only do trimming if the sorted file doesn’t already exist
+          if [[ ! -f "$TRIM_BAM_SORTED" ]]; then
+            echo "[$(date)] Trimming soft-clipped bases from read ends…"
+
+            # run the Python trimmer, writing to the unsorted BAM
+            "${PYTHON_EXE}" <<PYCODE
 import pysam
 
 in_bam   = "${BAM}"
-out_bam  = "${TRIM_BAM}"
-min_clip = ${MIN_SOFTCLIP_BASES}
+out_bam  = "${TRIM_BAM_UNSORTED}"
+min_clip = ${MIN_SOFTCLIP}
 
 bam_in  = pysam.AlignmentFile(in_bam, "rb")
 bam_out = pysam.AlignmentFile(out_bam, "wb", template=bam_in)
@@ -500,7 +559,7 @@ for read in bam_in.fetch():
 
     read.pos += head_clip
     seq = read.query_sequence
-    qual= read.query_qualities
+    qual = read.query_qualities
     new_seq  = seq[head_clip: len(seq)-tail_clip if tail_clip>0 else None]
     new_qual = qual[head_clip: len(qual)-tail_clip if tail_clip>0 else None]
 
@@ -517,12 +576,20 @@ bam_in.close()
 bam_out.close()
 PYCODE
 
-          samtools sort -o "${TRIM_BAM%.bam}.sorted.bam" "$TRIM_BAM"
-          samtools index "${TRIM_BAM%.bam}.sorted.bam"
-          BAM="${TRIM_BAM%.bam}.sorted.bam"
-          echo "[$(date)] Updated BAM with trimmed read ends: $BAM"
+            # sort & index the trimmed BAM
+            samtools sort -o "$TRIM_BAM_SORTED" "$TRIM_BAM_UNSORTED"
+            samtools index "$TRIM_BAM_SORTED"
+
+            echo "[$(date)] Updated BAM with trimmed read ends: $TRIM_BAM_SORTED"
+          else
+            echo "[$(date)] Skipping trim – found existing $TRIM_BAM_SORTED"
+          fi
+
+          # point downstream steps at the (new or existing) trimmed BAM
+          BAM="$TRIM_BAM_SORTED"
         fi
       fi
+
 
 
 
@@ -534,17 +601,19 @@ PYCODE
                    | awk '{sum+=$3; cnt++} END {print (cnt? sum/cnt : 0)}')
         printf "[%s] Mean coverage: %.1f×\n" "$(date)" "${mean_cov}"
 
-        # Check if auto_subsample is enabled
-        if [[ "$auto_subsample" == "true" ]]; then
-          if (( $(echo "${mean_cov} > ${max_coverage}" | bc -l) )); then
-            echo "[$(date)] auto_subsample=true: Coverage ≥ ${max_coverage}×, downsampling to ${target_coverage}…"
+         # Check if auto_subsample is enabled
+        if [[ "$AUTO_SUBSAMPLE" == "true" ]]; then
+          if (( $(echo "${mean_cov} > ${MAX_COV}" | bc -l) )); then
+            echo "[$(date)] auto_subsample=true: Coverage ≥ ${MAX_COV}×, downsampling to ${TARGET_COV}…"
 
-"${PYTHON_EXE}" <<PYCODE
+          PYTHON_EXE="$CONDA_PREFIX/bin/python"
+
+          "${PYTHON_EXE}" <<PYCODE
 import pysam, random
 
 IN_BAM  = "${BAM}"
 OUT_BAM = "${subbam}"
-TARGET  = ${target_coverage}
+TARGET  = ${TARGET_COV}
 
 # 1) Build a contig‐aware depth map
 depth = {}
@@ -578,20 +647,22 @@ with pysam.AlignmentFile(IN_BAM, "rb") as bam, \
 PYCODE
 
         else
-          echo "[$(date)] auto_subsample=true: Coverage ≤ ${max_coverage}×; no downsampling needed (copying original)."
+          echo "[$(date)] auto_subsample=true: Coverage ≤ ${MAX_COV}×; no downsampling needed (copying original)."
           cp "${BAM}" "${subbam}"
         fi
+
       else
         echo "[$(date)] auto_subsample=false: Skipping coverage-based downsampling (copying original)."
         cp "${BAM}" "${subbam}"
       fi
 
-      samtools index "${subbam}"
-      BAM="${subbam}"
-    else
-      echo "[$(date)] Depth-capped BAM exists; skipping coverage analysis."
-      BAM="${subbam}"
-    fi
+        samtools index "${subbam}"
+        BAM="${subbam}"
+      else
+        echo "[$(date)] Depth-capped BAM exists; skipping coverage analysis."
+        BAM="${subbam}"
+      fi
+
 
       # ─── Extract mapped reads ─────────────────────────────────────────────────
       P1="$SAMPLE_DIR/${sample}.mapped_1.fastq.gz"
@@ -602,23 +673,16 @@ PYCODE
       if [[ ! -s "$P1" || ! -s "$P2" || "$BAM" -nt "$P1" || "$BAM" -nt "$P2" ]]; then
         echo "[$(date)] Extracting properly-paired primary alignments"
         rm -f "$P1" "$P2" "$U0"
-        
-        # Extract only properly paired reads to avoid mate-pair mismatches
         samtools view -h -@ "$THREADS" \
           -b \
-          -f 1 -f 2 \
-          -F 4 -F 8 -F 256 -F 2048 \
+          -F 4 \
           -q "$MAPQ" \
           "$BAM" |
         samtools collate -uO -@ "$THREADS" - |
         samtools fastq -@ "$THREADS" \
           -1 "$P1" \
           -2 "$P2" \
-          -0 /dev/null \
-          -s /dev/null
-
-        # Create empty singletons file for compatibility
-        touch "$U0"
+          -s "$U0"
 
         # sanity check: ensure mate-pairs match
         p1=$(zgrep -c '^@' "$P1")
@@ -673,7 +737,7 @@ PYCODE
             spades.py --careful
               -1 "$P1" -2 "$P2"
               "${SING_OPTS[@]}"
-              -t "$THREADS" -m "$MEM_GB"
+              -t "$THREADS" -m "$MEM"
               -o "$SP_DIR"
           )
 
@@ -710,7 +774,7 @@ PYCODE
             --out-dir "$MH_DIR" \
             --num-cpu-threads "$THREADS" \
             --min-contig-len 400 \
-            --memory "$MEM_GB" \
+            --memory "$MEM" \
             --verbose \
             --keep-tmp-files
           )
@@ -919,10 +983,9 @@ PYCODE
 
 
       # 4) Merge ITSx + contigs into the final sample FASTA
-      #    Order doesn’t matter here, but this puts contigs first
       cat "$CONTIGS_FASTA" "$ITSX_FASTA" > "$SAMPLE_SEQ_FASTA"
 
-      # 2) Build genus‐level reference
+      # 5a) Build genus‐level reference
       REF_GEN_FASTA="$PHYLO_DIR/${gen}_ref.fasta"
 
       if [[ ! -s "$REF_GEN_FASTA" ]]; then
@@ -936,7 +999,7 @@ PYCODE
           "$(date)" "$gen" "$REF_GEN_FASTA"
       fi
 
-      # 3) Combine sample + reference into one FASTA
+      # 5b) Combine sample + reference into one FASTA
       PHYLO_FASTA="$PHYLO_DIR/${gen}_phylo.fasta"
       cat "$REF_GEN_FASTA" "$SAMPLE_SEQ_FASTA" > "$PHYLO_FASTA"
       printf "[%s] Combined phylo FASTA: %s (%d refs + %d sample seqs)\n\n" \
@@ -944,10 +1007,11 @@ PYCODE
         "$(grep -c '^>' "$REF_GEN_FASTA")" \
         "$(grep -c '^>' "$SAMPLE_SEQ_FASTA")"
 
-      # 4) MAFFT alignment
+      # 6a) MAFFT alignment
       PHYLO_ALN="$PHYLO_DIR/${gen}.aln"
       if [[ -s "$PHYLO_ALN" ]]; then
         printf "[%s] Skipping MAFFT (alignment exists): %s\n\n" "$(date)" "$PHYLO_ALN"
+        t_align_end=$t_align_start
       else
         t_align_start=$(date +%s)
         conda activate ssuitslsu-mafft
@@ -957,28 +1021,138 @@ PYCODE
         printf "\n"
       fi
 
-      # 4.1) Trimming the alignment
+      # 6b) Trimming the alignment
       echo "Trimming the alignment..."
       source "$(conda info --base)/etc/profile.d/conda.sh"
       conda activate ssuitslsu-chimera
       PYTHON_EXE="$CONDA_PREFIX/bin/python"
       trimmed_aln="${PHYLO_ALN%.aln}.trimmed.aln"
+      export trimmed_aln="${PHYLO_ALN%.aln}.trimmed.aln"
+      export PHYLO_RAW="$PHYLO_ALN"
+      export PHYLO_ALN="$trimmed_aln"
+      export PHYLO_DIR="$PHYLO_DIR"
+      export ITSX_DIR="$ITSX_DIR"
+      export sample="$sample"
 
-      "$PYTHON_EXE" <<PYCODE
-from Bio import AlignIO, os
+      read START TAIL <<< "$("$PYTHON_EXE" <<PYCODE
+import os, re, csv
+from Bio import AlignIO
+import sys
 
-# load & trim
-raw = AlignIO.read("${PHYLO_ALN}", "fasta")
-n, L = len(raw), raw.get_alignment_length()
+# 0) parse sample-level ITSx position files into regions dict
+regions = {}
+small_file = os.path.join(os.environ["ITSX_DIR"], f"{os.environ['sample']}.small.positions.txt")
+large_file = os.path.join(os.environ["ITSX_DIR"], f"{os.environ['sample']}.large_nhmmer.positions.txt")
+pos_file = large_file if os.path.exists(large_file) else (small_file if os.path.exists(small_file) else None)
+if pos_file:
+    with open(pos_file) as fh:
+        for line in fh:
+            parts = line.strip().split('\t')
+            sid = parts[0]
+            regmap = {}
+            for fld in parts[2:]:
+                if ':' not in fld:
+                    continue
+                name, coords = fld.split(':',1)
+                m = re.match(r"^(\d+)\s*-\s*(\d+)$", coords.strip())
+                if not m:
+                    continue
+                start, end = map(int, m.groups())
+                regmap[name] = (start, end)
+            if regmap:
+                regions[sid] = regmap
+                # DEBUG #1: raw ITSx coords
+                for region, (cstart, cend) in regmap.items():
+                    print(f"[DBG] {sid} {region}: raw contig coords {cstart}-{cend}", file=sys.stderr)
+
+# 1) load raw MSA and compute occupancy
+raw = AlignIO.read(os.environ["PHYLO_RAW"], "fasta")
+n = len(raw)
+L = raw.get_alignment_length()
 occ = [sum(rec.seq[i] != "-" for rec in raw) for i in range(L)]
-half = n/2.0
-start = next(i for i,o in enumerate(occ) if o >= half)
-end   = L - next(i for i,o in enumerate(reversed(occ)) if o >= half)
-trimmed = raw[:, start:end]
+half = n / 2.0
+start_occ = next(i for i,o in enumerate(occ) if o >= half)
+end_occ   = L - next(i for i,o in enumerate(reversed(occ)) if o >= half)
 
-# write out to the known path
-AlignIO.write(trimmed, "${trimmed_aln}", "fasta")
+# 2) build contig→raw map for every sequence (1-based columns)
+contig2raw = {}
+for rec in raw:
+    mapping = {}
+    ungapped = 0
+    for col, nt in enumerate(str(rec.seq), start=1):
+        if nt != "-":
+            ungapped += 1
+            mapping[ungapped] = col
+    contig2raw[rec.id] = mapping
+
+# 3) extract ITSx start/end columns from contig→raw mapping
+ssu_cols = []
+lsu_cols = []
+for sid, mapping in contig2raw.items():
+    if sid not in regions:
+        continue
+    for region, (cs, ce) in regions[sid].items():
+        if region.upper().startswith('SSU') and cs in mapping:
+            ssu_cols.append(mapping[cs])
+        if region.upper().startswith('LSU') and ce in mapping:
+            lsu_cols.append(mapping[ce])
+
+# 4) global ITSx span (fallback to occupancy)
+global_ssu_start = min(ssu_cols) if ssu_cols else start_occ
+global_lsu_end   = max(lsu_cols) if lsu_cols else end_occ
+
+# 5) merge with occupancy cutpoints
+trim_start = min(start_occ, global_ssu_start - 1)
+trim_end   = max(end_occ,   global_lsu_end + 1)
+
+# 6) slice & write trimmed alignment
+trimmed = raw[:, trim_start:trim_end]
+AlignIO.write(trimmed, os.environ["trimmed_aln"], "fasta")
+
+# 7) rebuild contig→trim mapping in 0-based trimmed coordinates
+contig2trim = {}
+for sid, mapping in contig2raw.items():
+    newmap = {}
+    for cpos, rawcol in mapping.items():
+        idx_trim = rawcol - 1 - trim_start
+        if 0 <= idx_trim < trimmed.get_alignment_length():
+            newmap[cpos] = idx_trim
+    contig2trim[sid] = newmap
+    # DEBUG #3: trimmed ITSx coords
+    if sid in regions:
+        for region, (cs, ce) in regions[sid].items():
+            tstart = newmap.get(cs)
+            tend   = newmap.get(ce)
+            print(f"[DBG] {sid} {region}: trimmed coords {tstart}-{tend}", file=sys.stderr)
+
+# 8) Write raw vs trimmed ITSx coords to TSV
+out_tsv = os.path.join(
+    os.environ["PHYLO_DIR"],
+    f"{os.environ['sample']}_ITSx_coords_aln_trimmed.tsv"
+)
+print(f"DEBUG(tri): writing TSV → {out_tsv}", file=sys.stderr)
+with open(out_tsv, "w") as out:
+    out.write("contig_id\tregion\traw_start\traw_end\ttrimmed_start\ttrimmed_end\n")
+    for sid, regmap in regions.items():
+        raw_map  = contig2raw.get(sid, {})
+        trim_map = contig2trim.get(sid, {})
+        for region, (cs, ce) in regmap.items():
+            raw_s = raw_map.get(cs, "")
+            raw_e = raw_map.get(ce, "")
+            t_s   = trim_map.get(cs, "")
+            t_e   = trim_map.get(ce, "")
+            out.write(f"{sid}\t{region}\t"
+                      f"{raw_s}\t{raw_e}\t{t_s}\t{t_e}\n")
+
+# 9) report how many columns trimmed off each end
+print(trim_start, L - trim_end)
+
+
 PYCODE
+)"
+
+      export TRIM_HEAD=$START
+      export TRIM_TAIL=$TAIL
 
       # sanity check & override
       if [[ ! -s "$trimmed_aln" ]]; then
@@ -986,9 +1160,10 @@ PYCODE
         exit 1
       fi
 
-      PHYLO_ALN="$trimmed_aln"
+      TRIMMED_ALN="$trimmed_aln"
+      export PHYLO_ALN="$TRIMMED_ALN"
 
-      # 5) IQ-TREE ML inference
+      # 7) IQ-TREE ML inference
       PHYLO_PREFIX="$PHYLO_DIR/${gen}"
       TREEFILE="${PHYLO_PREFIX}.treefile"
       if [[ -f "${PHYLO_PREFIX}.ckp.gz" ]]; then
@@ -998,11 +1173,11 @@ PYCODE
         conda activate ssuitslsu-iqtree
         printf "[%s] Running IQ-TREE → prefix %s\n" "$(date)" "$PHYLO_PREFIX"
         iqtree \
-          -s "$PHYLO_ALN" \
+          -s "$TRIMMED_ALN" \
           -m MFP \
           -nt AUTO \
           -ntmax "${THREADS}" \
-          -mem "${MEM_GB}G" \
+          -mem "${MEM}G" \
           -nt AUTO \
           -bb 1000 \
           -pre "$PHYLO_PREFIX"
@@ -1015,219 +1190,23 @@ PYCODE
       echo "[`date`] Starting chimera detection for $sample..."
       t_chimera_start=$(date +%s)
 
-      CHIMERA_DIR="${SAMPLE_DIR}/chimera"
-      mkdir -p "$CHIMERA_DIR"
-      CHIMERA_REPORT="${CHIMERA_DIR}/${sample}_chimera_report.tsv"
-      CHIMERA_PLOT="${CHIMERA_DIR}/${sample}_pdist_all.png"
-
       conda activate ssuitslsu-chimera
-      PYTHON_EXE="$CONDA_PREFIX/bin/python"
-      GENUS_REF_FASTA="$PHYLO_DIR/${gen}_ref.fasta"
 
-      "$PYTHON_EXE" <<PYCODE
-import os
-import re
-import math
-from Bio import AlignIO, Phylo
-from Bio.Align import MultipleSeqAlignment
-from Bio.Seq import Seq
-from Bio.SeqRecord import SeqRecord
-import matplotlib.pyplot as plt
+      export CHIMERA_DIR="${SAMPLE_DIR}/chimera"
+      export PHYLO_RAW="$PHYLO_RAW"
+      export TRIM_HEAD="$TRIM_HEAD"
+      export PHYLO_ALN="$PHYLO_ALN"
+      export TREEFILE="$TREEFILE"
+      export CONTIGS_FASTA="$CONTIGS_FASTA"
+      export GENUS_REF_FASTA="$PHYLO_DIR/${gen}_ref.fasta"
+      export CHIMERA_REPORT="${CHIMERA_DIR}/${sample}_chimera_report.tsv"
+      export CHIMERA_PLOT="${CHIMERA_DIR}/${sample}_chimera_plot.png"
+      export sample="$sample"
+      export ITSX_DIR="$ITSX_DIR"
 
-# ─── Environment variables ────────────────────────────────────────────
-aln_path        = "${PHYLO_ALN}"
-tree_file       = "${TREEFILE}"
-contigs_fasta   = "${CONTIGS_FASTA}"
-genus_ref_fasta = "${GENUS_REF_FASTA}"
-out_tsv         = "${CHIMERA_REPORT}"
-plot_path       = "${CHIMERA_PLOT}"
+      mkdir -p "$CHIMERA_DIR"
 
-# ─── Load & clean tree ─────────────────────────────────────────────────
-tree = Phylo.read(tree_file, "newick")
-def clean_id(seq_id):
-    return re.sub(r"[^0-9a-zA-Z]+", "_", seq_id)
-for leaf in tree.get_terminals():
-    leaf.name = re.sub(r'^_?R_', '', clean_id(leaf.name))
-tree_leaves = {leaf.name for leaf in tree.get_terminals()}
-
-# ─── Load & clean alignment ────────────────────────────────────────────
-alignment = AlignIO.read(aln_path, "fasta")
-for rec in alignment:
-    rec.id = rec.name = re.sub(r'^_?R_', '', clean_id(rec.id))
-alignment_dict = {rec.id: rec for rec in alignment}
-
-# ─── Read & filter contigs by depth ≥100 ───────────────────────────────
-with open(contigs_fasta) as f:
-    headers = [line[1:].strip() for line in f if line.startswith(">")]
-
-sample_contig_ids = []
-for hdr in headers:
-    parts = hdr.split()
-    cid = parts[0]
-    if cid.startswith("NODE_"):
-        m = re.search(r"cov_([0-9]+(?:\.[0-9]+)?)$", cid)
-        if m and float(m.group(1)) >= 100:
-            sample_contig_ids.append(cid)
-    else:
-        info = dict(p.split("=",1) for p in parts[1:] if "=" in p)
-        if float(info.get("multi", 0.0)) >= 100:
-            sample_contig_ids.append(cid)
-
-sample_seqs = [
-    clean_id(cid) for cid in sample_contig_ids
-    if clean_id(cid) in alignment_dict and clean_id(cid) in tree_leaves
-]
-
-# ─── Build genus‐level reference list ─────────────────────────────────
-with open(genus_ref_fasta) as f:
-    raw_refs = [line[1:].strip().split()[0] for line in f if line.startswith(">")]
-ref_seq_ids = [
-    clean_id(rid) for rid in raw_refs
-    if clean_id(rid) in alignment_dict and clean_id(rid) in tree_leaves
-]
-
-# ─── Helpers ───────────────────────────────────────────────────────────
-def short_id(seq_id):
-    parts = [p for p in seq_id.split("_") if p]
-    return "_".join(parts[:2]) if len(parts) >= 2 else (parts[0] if parts else seq_id)
-
-def get_closest_ref(sid):
-    dists = [(rid, tree.distance(sid, rid)) for rid in ref_seq_ids]
-    return min(dists, key=lambda x: x[1])[0] if dists else None
-
-def kimura2p(s1, s2):
-    """Compute Kimura-2P distance over aligned strings (no gaps)."""
-    pairs = [(a.upper(),b.upper()) for a,b in zip(s1,s2) if a!='-' and b!='-']
-    L = len(pairs)
-    if L == 0:
-        return float("nan")
-    ti = sum(1 for a,b in pairs if (a,b) in (('A','G'),('G','A'),('C','T'),('T','C')))
-    tv = sum(1 for a,b in pairs if a!=b and (a,b) not in (('A','G'),('G','A'),('C','T'),('T','C')))
-    P = ti / L
-    Q = tv / L
-    try:
-        return -0.5 * math.log(1 - 2*P - Q) - 0.25 * math.log(1 - 2*Q)
-    except ValueError:
-        return float("nan")
-
-def sliding_k2p(sid, rid, win=100, step=20):
-    rec1 = alignment_dict[sid].seq
-    rec2 = alignment_dict[rid].seq
-    L    = len(rec1)
-    prof = []
-    for i in range(0, L - win + 1, step):
-        w1 = str(rec1[i:i+win])
-        w2 = str(rec2[i:i+win])
-        # skip only if one sequence is all gaps
-        if all(c=='-' for c in w1) or all(c=='-' for c in w2):
-            continue
-        # gap fraction
-        gap_sites = sum(1 for a,b in zip(w1,w2) if a=='-' or b=='-')
-        gap_frac  = gap_sites / win
-        # distance on overlapping sites
-        pairs = [(a,b) for a,b in zip(w1,w2) if a!='-' and b!='-']
-        if pairs:
-            s1 = "".join(a for a,_ in pairs)
-            s2 = "".join(b for _,b in pairs)
-            d   = kimura2p(s1, s2)
-        else:
-            d = float("nan")
-        prof.append((i + win//2, d, gap_frac))
-    return prof
-
-def detect_chimera(profile, jump_thresh=0.15, stable_span=3):
-    pd = [p for _,p,_ in profile]
-    for j in range(1, len(pd) - stable_span):
-        if abs(pd[j] - pd[j-1]) > jump_thresh and all(
-           abs(pd[j+k] - pd[j]) < 0.05 for k in range(1, stable_span+1)
-        ):
-            return True
-    return False
-
-# ─── Run chimera detection, plot, and write report ─────────────────────
-n = len(sample_seqs)
-if n == 0:
-    print("[WARN] No contigs passed filters – exiting.")
-    exit(0)
-
-ncols = 2
-nrows = (n + ncols - 1) // ncols
-fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12, 4*nrows), squeeze=False)
-
-with open(out_tsv, "w") as out:
-    out.write("contig_id\tclosest_ref\tglobal_k2p\tis_chimera\tavg_gap_frac\n")
-    for idx, sid in enumerate(sample_seqs):
-        ref = get_closest_ref(sid)
-        if not ref:
-            continue
-
-        # global K2P distance
-        seq1 = str(alignment_dict[sid].seq)
-        seq2 = str(alignment_dict[ref].seq)
-        global_k2p = kimura2p(seq1, seq2)
-
-        # sliding windows
-        profile = sliding_k2p(sid, ref)
-
-        chim = detect_chimera(profile)
-        avg_gap = sum(g for _,_,g in profile) / len(profile) if profile else 0
-        out.write(f"{sid}\t{ref}\t{global_k2p:.6f}\t{chim}\t{avg_gap:.3f}\n")
-
-        # plotting
-        row, col = divmod(idx, ncols)
-        ax = axes[row][col]
-        if not profile:
-            ax.set_visible(False)
-            continue
-        x, y, g = zip(*profile)
-        ax.axhline(global_k2p,
-                   color='tab:orange', linestyle='--',
-                   label='global K2P', zorder=1)
-        ax.plot(x, y,
-                color='tab:blue', label='sliding K2P', zorder=2)
-        # optional gap shading
-        ax.fill_between(x, 0, g, step='mid', alpha=0.2,
-                        color='gray', label='gap fraction')
-
-        ax.set_title(
-            f"{short_id(sid)} vs {short_id(ref)}\n{'chimera' if chim else 'clean'}",
-            color=('red' if chim else 'darkgreen')
-        )
-        ax.set_xlabel("Position (bp)")
-        ax.set_ylabel("K2P distance")
-        ax.legend()
-
-# remove any empty panels
-for i in range(n, nrows*ncols):
-    r, c = divmod(i, ncols)
-    fig.delaxes(axes[r][c])
-
-plt.tight_layout()
-plt.savefig(plot_path)
-plt.close()
-
-# ─── Build HTML report ───────────────────────────────────────────────────
-sample_name = os.path.basename(out_tsv).replace("_chimera_report.tsv", "")
-html_path   = os.path.join(os.path.dirname(out_tsv), f"{sample_name}_chimera_report.html")
-with open(out_tsv) as tsv, open(html_path, "w") as html:
-    html.write(f"<h2>Chimera report for {sample_name}</h2>\n")
-    html.write(f'<img src="{os.path.basename(plot_path)}" style="max-width:100%;"><br>\n')
-    html.write("<table border=1 cellpadding=4>"
-               "<tr><th>contig_id</th><th>closest_ref</th>"
-               "<th>global_k2p</th><th>is_chimera</th><th>avg_gap_frac</th></tr>\n")
-    next(tsv)
-    for line in tsv:
-        contig, ref, dist, is_chim, avg_gap = line.strip().split("\t")
-        color = "red" if is_chim == "True" else "darkgreen"
-        html.write(
-          f'<tr><td>{contig}</td><td>{ref}</td>'
-          f'<td>{dist}</td>'
-          f'<td style="color:{color};font-weight:bold">{is_chim}</td>'
-          f'<td>{avg_gap}</td></tr>\n'
-        )
-    html.write("</table>\n")
-PYCODE
-
+      python3 scripts/chimera_pipeline.py
 
 
       t_chimera_end=$(date +%s)
@@ -1267,4 +1246,4 @@ PYCODE
   done
 done
 
-echo "[`date`] ALL SAMPLES COMPLETE."
+echo "[$(date)] ALL SAMPLES COMPLETE."
