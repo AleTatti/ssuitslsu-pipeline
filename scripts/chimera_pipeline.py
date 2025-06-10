@@ -70,8 +70,6 @@ def main():
                 contig_pos += 1
                 mapping[contig_pos] = aln_idx + 1
         contig2aln[sid] = mapping
-        # DEBUG #2: mapping from contig positions → MSA columns
-        print(f"[DBG] contig2aln for {sid}: {mapping}")
 
 
     # ─── Determine which ITSx positions file to use ────────────────────────
@@ -107,8 +105,6 @@ def main():
                     regmap[name] = (start, end)
                 if regmap:
                   regions[node] = regmap
-                  # DEBUG #1: raw ITSx start/end on contig coords
-                  print(f"[DBG] Extracted ITSx coords for {node}: {regmap}")
 
 
     # colour map for shading
@@ -190,9 +186,6 @@ def main():
 
             # drop columns where both have gaps
             filtered      = [(a,b) for a,b in zip(w1, w2) if not (a=='-' and b=='-')]
-
-            # DEBUG #4: how many sites we kept vs. full window
-            print(f"[DBG] sliding_k2p window {i}-{i+win}: kept {len(filtered)} of {win}")
 
             # if filtered is empty, that window was 100% gaps in both => skip it entirely
             if not filtered:

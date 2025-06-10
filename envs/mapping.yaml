@@ -4,12 +4,11 @@ channels:
   - conda-forge
   - bioconda
   - defaults
-channel_priority: strict
 
 dependencies:
   - python=3.9
   - bwa-mem2
-  - samtools=1.17
+  - "samtools>=1.16"
   - bc
   - pip
   - pip:
