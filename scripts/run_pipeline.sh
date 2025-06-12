@@ -449,10 +449,9 @@ for fp in "$READS_DIR"/*; do
 
         # prepare log + output
         LOG="$SAMPLE_DIR/mapping.log"
-        OUT_BAM="$BAM"
 
         # remove any stale BAM/index
-        rm -f "$OUT_BAM" "${OUT_BAM}.bai" "$LOG"
+        rm -f "$BAM" "${BAM}.bai" "$LOG"
 
         # ─── Do the mapping inside a subshell so exec 4<> is scoped ──────────────
         echo "[$(date)] Mapping paired and unpaired reads (MAPQ ≥ $MAPQ)"
@@ -467,7 +466,7 @@ for fp in "$READS_DIR"/*; do
                 | samtools view -hb -@ "$THREADS" -q "$MAPQ" - ) \
             <( bwa-mem2 mem -t "$THREADS" "$SAMPLE_REF" "$un_rev"       2>&4 \
                 | samtools view -hb -@ "$THREADS" -q "$MAPQ" - ) \
-          | samtools sort -@ "$THREADS" -o "$OUT_BAM"
+          | samtools sort -@ "$THREADS" -o "$BAM"
 
           # close FD-4 before exiting subshell
           exec 4>&-
@@ -475,7 +474,7 @@ for fp in "$READS_DIR"/*; do
 
         # index for downstream pysam.fetch()
         echo "[$(date)] Indexing final BAM"
-        samtools index "$OUT_BAM"
+        samtools index "$BAM"
 
       else
         echo "[$(date)] Skipping mapping (BAM exists)"
