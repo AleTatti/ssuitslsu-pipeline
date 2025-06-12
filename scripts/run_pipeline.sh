@@ -435,13 +435,10 @@ for fp in "$READS_DIR"/*; do
       # ─── Mapping + auto‐subsampling ──────────────────────────────────────────────
       t_map_start=$(date +%s)
       BAM="$SAMPLE_DIR/${sample}.sorted.bam"
-      sub1="$SAMPLE_DIR/${sample}.sub_1P.fastq.gz"
-      sub2="$SAMPLE_DIR/${sample}.sub_2P.fastq.gz"
 
       set +u
       conda activate ssuitslsu-mapping
       set -u
-      # ensure we have a python binary to run our inline script
       PYTHON_EXE="${CONDA_PREFIX}/bin/python"
       [[ ! -x "$PYTHON_EXE" ]] && PYTHON_EXE=python
 
@@ -450,13 +447,36 @@ for fp in "$READS_DIR"/*; do
         # build the index if needed
         [[ ! -f "${SAMPLE_REF}.bwt.2bit.64" ]] && bwa-mem2 index "$SAMPLE_REF"
 
-        echo "[$(date)] Mapping reads (MAPQ ≥ $MAPQ)" ##here I keep the unmapped reads
-        bwa-mem2 mem -v0 -t "$THREADS" "$SAMPLE_REF" "$R1" "$R2" \
-          2> "$SAMPLE_DIR/mapping.log" \
-        | samtools view -b -@ "$THREADS" -q "$MAPQ" \
-        | samtools sort -@ "$THREADS" -o "$BAM"
+        # prepare log + output
+        LOG="$SAMPLE_DIR/mapping.log"
+        OUT_BAM="$BAM"
 
-        samtools index "$BAM"
+        # remove any stale BAM/index
+        rm -f "$OUT_BAM" "${OUT_BAM}.bai" "$LOG"
+
+        # ─── Do the mapping inside a subshell so exec 4<> is scoped ──────────────
+        echo "[$(date)] Mapping paired and unpaired reads (MAPQ ≥ $MAPQ)"
+        (
+          # redirect FD-4 to the log
+          exec 4> "$LOG"
+
+          samtools merge -u -@ "$THREADS" - \
+            <( bwa-mem2 mem -t "$THREADS" "$SAMPLE_REF" "$R1"   "$R2"   2>&4 \
+                | samtools view -hb -@ "$THREADS" -q "$MAPQ" - ) \
+            <( bwa-mem2 mem -t "$THREADS" "$SAMPLE_REF" "$un_fw"        2>&4 \
+                | samtools view -hb -@ "$THREADS" -q "$MAPQ" - ) \
+            <( bwa-mem2 mem -t "$THREADS" "$SAMPLE_REF" "$un_rev"       2>&4 \
+                | samtools view -hb -@ "$THREADS" -q "$MAPQ" - ) \
+          | samtools sort -@ "$THREADS" -o "$OUT_BAM"
+
+          # close FD-4 before exiting subshell
+          exec 4>&-
+        )
+
+        # index for downstream pysam.fetch()
+        echo "[$(date)] Indexing final BAM"
+        samtools index "$OUT_BAM"
+
       else
         echo "[$(date)] Skipping mapping (BAM exists)"
         [[ ! -f "${BAM}.bai" ]] && samtools index "$BAM"
@@ -464,78 +484,83 @@ for fp in "$READS_DIR"/*; do
 
       # fail early if no alignments
       [[ ! -s "$BAM" ]] && echo "!! Empty BAM; skipping sample" && continue 2
+      
+      # Only do soft-clip filtering/trimming if the flag is set
+      if [[ $FILTER_SOFTCLIP == true ]]; then
 
-      # ─── Soft-clip statistics and optional filtering ─────────────────────
-      SC_DIR="$SAMPLE_DIR/chimera/softclipped_reads"
-      mkdir -p "$SC_DIR"
-      STAT_FILE="$SC_DIR/${sample}_softclip_stats.txt"
+        # ─── Soft‐clip statistics + IGV BAM ─────────────────────────────────────────
+        SC_DIR="$SAMPLE_DIR/chimera/softclipped_reads"
+        mkdir -p "$SC_DIR"
+        STAT_FILE="$SC_DIR/${sample}_softclip_stats.txt"
+        echo "[$(date)] Soft-clip anaysis starts..."
 
-      # If stats file already exists, skip recomputing
-      if [[ -f "$STAT_FILE" ]]; then
-        echo "[$(date)] Soft-clip stats already present; skipping computation"
-      else
-        echo "[$(date)] Computing soft-clip statistics (min=${MIN_SOFTCLIP}, mode=${SOFTCLIP_MODE})" | tee "$STAT_FILE"
+        if [[ -f "$STAT_FILE" ]]; then
+          echo "[$(date)] Soft‐clip stats already present; skipping computation"
+        else
+          echo "[$(date)] Soft-clip stats computation starts..."
+          # 1) Total mapped reads
+          total_reads=$(samtools view -@ "$THREADS" -c "$BAM")
+          echo "Total mapped reads: $total_reads" > "$STAT_FILE"
 
-        # 1) Total count
-        total_reads=$(samtools view -@ "$THREADS" -c "$BAM")
-        echo "Total mapped reads: $total_reads" | tee -a "$STAT_FILE"
-
-        # 2) Softclip count 
-        samtools view -@ "$THREADS" "$BAM" \
-          | awk -v min="$MIN_SOFTCLIP" '
-              {
-                cigar = $6
-                # look for any NNNN S and test >= min
-                while (match(cigar, /[0-9]+S/)) {
-                  num = substr(cigar, RSTART, RLENGTH-1) + 0
-                  if (num >= min) {
-                    print      # emit this read into the SAM
-                    break
+          # 2) Count reads with ≥MIN_SOFTCLIP soft-clipped bases (no big SAM dump)
+          softclip_reads=$(samtools view -@ "$THREADS" -h "$BAM" \
+            | awk -v min="$MIN_SOFTCLIP" '
+                BEGIN { cnt = 0 }
+                /^@/ { next }
+                {
+                  cigar = $6
+                  while (match(cigar, /[0-9]+S/)) {
+                    num = substr(cigar, RSTART, RLENGTH-1) + 0
+                    if (num >= min) { cnt++; break }
+                    cigar = substr(cigar, RSTART + RLENGTH)
                   }
-                  cigar = substr(cigar, RSTART + RLENGTH)
                 }
-              }
-            ' > "$SC_DIR/${sample}.softclipped.sam"
+                END { print cnt }
+              ')
+          # 3) Compute percentage
+          pct=$(awk -v s="$softclip_reads" -v t="$total_reads" \
+                'BEGIN { printf("%.2f", t>0 ? s*100/t : 0) }')
 
-        softclip_reads=$(wc -l < "$SC_DIR/${sample}.softclipped.sam")
+          echo "Reads with ≥${MIN_SOFTCLIP} soft-clipped bases: $softclip_reads ($pct%)" \
+            >> "$STAT_FILE"
+        fi
 
-        # 3) Percentage
-        pct=$(awk -v s="$softclip_reads" -v t="$total_reads" \
-              'BEGIN{ if (t>0) printf("%.2f", s*100/t); else print "0.00" }')
+        # ─── Build IGV BAM of reads with ≥MIN_SOFTCLIP soft-clips ───────────────────
+        SC_BAM="$SC_DIR/${sample}.softclipped.sorted.bam"
+        if [[ ! -f "$SC_BAM" ]]; then
+          echo "[$(date)] Extracting reads with ≥${MIN_SOFTCLIP} soft-clips for IGV…"
+          samtools view -@ "$THREADS" -h "$BAM" \
+            | awk -v min="$MIN_SOFTCLIP" 'BEGIN{OFS="\t"}
+                /^@/ { print; next }
+                {
+                  cigar = $6; keep = 0
+                  while (match(cigar, /[0-9]+S/)) {
+                    if (substr(cigar, RSTART, RLENGTH-1)+0 >= min) { keep = 1; break }
+                    cigar = substr(cigar, RSTART + RLENGTH)
+                  }
+                  if (keep) print
+                }' \
+            | samtools view -b -@ "$THREADS" -o "$SC_DIR/${sample}.softclipped.bam" -
+          samtools sort -@ "$THREADS" -o "$SC_BAM" "$SC_DIR/${sample}.softclipped.bam"
+          samtools index "$SC_BAM"
+        fi
+        echo "[$(date)] Soft-clip stats computation end"
+        # ────────────────────────────────────────────────────────────────────────────
+        # If already processed, skip soft-clip and fixmate steps
+        CS_BAM="$SAMPLE_DIR/${sample}.fixmate.bam"
+        if [[ -f "$CS_BAM" ]]; then
+          echo "[$(date)] $CS_BAM already exists; skipping soft-clip and mate-fixing."
+          BAM="$CS_BAM"
+        else
+          # If filtering is enabled, either remove entire reads or trim the ends
+          echo "[$(date)] filter_softclipped_reads = $FILTER_SOFTCLIP"
+          echo "[$(date)] min_softclip_bases       = $MIN_SOFTCLIP"
+          echo "[$(date)] softclip_filter_mode     = $SOFTCLIP_MODE"
 
-        echo "Reads with ≥${MIN_SOFTCLIP} soft-clipped bases: $softclip_reads ($pct%)" \
-          | tee -a "$STAT_FILE"
-      fi
-
-      # Create a BAM of only the soft-clipped reads for IGV (once)
-      if [[ ! -f "$SC_DIR/${sample}.softclipped.sorted.bam" ]]; then
-        samtools view -@ "$THREADS" -H "$BAM" > "$SC_DIR/${sample}.softclipped_header.sam"
-        cat    "$SC_DIR/${sample}.softclipped_header.sam" \
-             "$SC_DIR/${sample}.softclipped.sam" \
-          | samtools view -@ "$THREADS" -bS -o "$SC_DIR/${sample}.softclipped.bam"
-        samtools sort -@ "$THREADS" \
-            -o "$SC_DIR/${sample}.softclipped.sorted.bam" \
-            "$SC_DIR/${sample}.softclipped.bam"
-        samtools index "$SC_DIR/${sample}.softclipped.sorted.bam"
-      fi
-
-
-      # If filtering is enabled, either remove entire reads or trim the ends
-      # ─── predefine final processed BAM ─────────────────────────────────────────
-      CS_BAM="$SAMPLE_DIR/${sample}.fixmate.bam"
-
-      # If already processed, skip soft-clip and fixmate steps
-      if [[ -f "$CS_BAM" ]]; then
-        echo "[$(date)] $CS_BAM already exists; skipping soft-clip and mate-fixing."
-      else
-        # If filtering is enabled, either remove entire reads or trim the ends
-        if [[ $FILTER_SOFTCLIP == true ]]; then
-
-          # ─── 1) Soft-clip filtering or trimming ─────────────────────────────────
+          # ─── 1) Soft-clip filtering or trimming ───────────────────────────────
           if [[ "$SOFTCLIP_MODE" == "full" ]]; then
             echo "[$(date)] Removing entire reads with ≥${MIN_SOFTCLIP} soft‐clips…"
             PROCESSED_BAM="$SAMPLE_DIR/${sample}.filtered.softclip.bam"
-
             samtools view -@ "$THREADS" -h "$BAM" \
               | awk -v min="$MIN_SOFTCLIP" 'BEGIN { OFS = "\t" }
                   /^@/ { print; next }
@@ -553,10 +578,8 @@ for fp in "$READS_DIR"/*; do
           elif [[ "$SOFTCLIP_MODE" == "trim" ]]; then
             echo "[$(date)] Trimming soft-clipped ends when min_clip>=${MIN_SOFTCLIP} …"
             TRIM_UNSORTED="$SAMPLE_DIR/${sample}.trimmed_softclip.unsorted.bam"
-
             "${PYTHON_EXE}" <<PYCODE
 import pysam
-
 in_bam   = "${BAM}"
 out_bam  = "${TRIM_UNSORTED}"
 min_clip = ${MIN_SOFTCLIP}
@@ -579,7 +602,6 @@ for r in bam_in.fetch(until_eof=True):
 bam_out.close()
 bam_in.close()
 PYCODE
-
             PROCESSED_BAM="$TRIM_UNSORTED"
           fi  # end SOFTCLIP_MODE
 
@@ -587,7 +609,7 @@ PYCODE
           BAM="$PROCESSED_BAM"
           echo "[$(date)] Soft‐clip step done; now fixing pairing flags on $BAM"
 
-          # ─── 2) One-time: name-sort → fixmate → coord-sort → index ────────────
+          # ─── 2) Name-sort → fixmate → coord-sort → index ───────────────────────
           echo "[$(date)] Fixing mate flags on ${BAM} …"
           NS_BAM="$SAMPLE_DIR/${sample}.fix.ns.bam"
           FM_BAM="$SAMPLE_DIR/${sample}.fixmate.ns.bam"
@@ -603,12 +625,14 @@ PYCODE
 
           BAM="$CS_BAM"
           echo "[$(date)] Finished fixmate; downstream BAM is $BAM"
-
         fi  # end FILTER_SOFTCLIP
+        echo "[$(date)] Soft-clip analysis ends"  
       fi  # end already-processed check
+      
 
       # ─── Coverage check + optional capping  ──────────────────────────────────────
       subbam="${SAMPLE_DIR}/${sample}.depthcapped.bam"
+      RUN_FIXMATE=false
       if [[ ! -f "${subbam}" ]]; then
         # Always compute and display mean coverage for reporting
         mean_cov=$(samtools depth -a "${BAM}" \
@@ -616,12 +640,12 @@ PYCODE
         printf "[%s] Mean coverage: %.1f×\n" "$(date)" "${mean_cov}"
 
         # Check if auto_subsample is enabled
-        if [[ "$AUTO_SUBSAMPLE" == "true" ]]; then
-          if (( $(echo "${mean_cov} > ${MAX_COV}" | bc -l) )); then
-            echo "[$(date)] auto_subsample=true: Coverage ≥ ${MAX_COV}×, downsampling to ${TARGET_COV}…"
+        if [[ "$AUTO_SUBSAMPLE" == "true" && $(echo "$mean_cov > $MAX_COV" | bc -l) -eq 1 ]]; then
 
-            PYTHON_EXE="$CONDA_PREFIX/bin/python"
-            "${PYTHON_EXE}" <<PYCODE
+          echo "[$(date)] auto_subsample=true: Coverage ≥ ${MAX_COV}×, downsampling to ${TARGET_COV}…"
+
+          PYTHON_EXE="$CONDA_PREFIX/bin/python"
+          "${PYTHON_EXE}" <<PYCODE
 import pysam, random
 
 IN_BAM  = "${BAM}"
@@ -632,6 +656,9 @@ TARGET  = ${TARGET_COV}
 depth = {}
 with pysam.AlignmentFile(IN_BAM, "rb") as bam:
     for read in bam.fetch():
+        # skip unaligned or incomplete reads
+        if read.is_unmapped or read.reference_start is None or read.reference_end is None:
+            continue
         rname = read.reference_name
         for pos in range(read.reference_start, read.reference_end):
             depth[(rname, pos)] = depth.get((rname, pos), 0) + 1
@@ -640,13 +667,14 @@ with pysam.AlignmentFile(IN_BAM, "rb") as bam:
 keep_names = set()
 with pysam.AlignmentFile(IN_BAM, "rb") as bam:
     for read in bam.fetch():
+        if read.is_unmapped or read.reference_start is None or read.reference_end is None:
+            continue
         rname = read.reference_name
-        # for each base, compute local “keep” ratio = min(1, TARGET/depth)
-        ratios = [
-            min(1.0, TARGET / depth[(rname, p)])
-            for p in range(read.reference_start, read.reference_end)
-        ]
-        # average ratio across the read = probability to KEEP it
+        # compute per-base keep ratios
+        positions = range(read.reference_start, read.reference_end)
+        ratios = [min(1.0, TARGET / depth[(rname, p)]) for p in positions]
+        if not ratios:
+            continue
         p_keep = sum(ratios) / len(ratios)
         if random.random() < p_keep:
             keep_names.add(read.query_name)
@@ -659,41 +687,48 @@ with pysam.AlignmentFile(IN_BAM, "rb") as bam, \
             out.write(read)
 PYCODE
 
-            else
-              echo "[$(date)] auto_subsample=true: Coverage ≤ ${MAX_COV}×; no downsampling needed (copying original)."
-              cp "${BAM}" "${subbam}"
-            fi
+          RUN_FIXMATE=true
+        else
+          echo "[$(date)] auto_subsample=false: Skipping coverage-based downsampling (copying original)."
+          cp "${BAM}" "${subbam}"
+          RUN_FIXMATE=false
+        fi
 
-          else
-            echo "[$(date)] auto_subsample=false: Skipping coverage-based downsampling (copying original)."
-            cp "${BAM}" "${subbam}"
-          fi
+        if [[ "$RUN_FIXMATE" == true ]]; then
 
           FIXMATE_NS="${SAMPLE_DIR}/${sample}.depthcapped.namesorted.bam"
           FIXMATE_NS_OUT="${SAMPLE_DIR}/${sample}.depthcapped.fixmate.namesorted.bam"
           FIXMATE_CS="${SAMPLE_DIR}/${sample}.depthcapped.fixmate.coordsorted.bam"
 
+          # 1) Name-sort (if not already done)
           if [[ ! -f "$FIXMATE_NS" ]]; then
-              echo "[$(date)] Name-sort depthcapped BAM for fixmate…"
-              samtools sort -n -@ "$THREADS" -o "$FIXMATE_NS" "$subbam"
+            echo "[$(date)] Name-sorting depthcapped BAM…"
+            samtools sort -n -@ "$THREADS" -o "$FIXMATE_NS" "$subbam"
           fi
 
+          # 2) fixmate (if not already done)
           if [[ ! -f "$FIXMATE_NS_OUT" ]]; then
-              echo "[$(date)] Applying fixmate on ${FIXMATE_NS}..."
-              samtools fixmate -m -@ "$THREADS" "$FIXMATE_NS" "$FIXMATE_NS_OUT"
+            echo "[$(date)] Applying fixmate…"
+            samtools fixmate -m -@ "$THREADS" "$FIXMATE_NS" "$FIXMATE_NS_OUT"
           fi
 
+          # 3) coord-sort + filter unmapped + index (if not already done)
           if [[ ! -f "$FIXMATE_CS" ]]; then
-              echo "[$(date)] Coordinate-sort of ${FIXMATE_NS_OUT}..."
-              samtools view -@ "$THREADS" -b -F 4 "$FIXMATE_NS_OUT" \
-                | samtools sort -@ "$THREADS" -o "$FIXMATE_CS"
-              samtools index "$FIXMATE_CS"
+            echo "[$(date)] Coordinate-sorting and filtering…"
+            samtools view -bh -@ "$THREADS" -F 4 "$FIXMATE_NS_OUT" \
+              | samtools sort -@ "$THREADS" -o "$FIXMATE_CS"
+            samtools index "$FIXMATE_CS"
           fi
 
           BAM="$FIXMATE_CS"
+        else
+          # no fixmate at all if RUN_FIXMATE=false
+          BAM="$subbam"
+        fi
 
       else
-          echo "[$(date)] Depth-capped BAM exists; skipping coverage analysis."
+        echo "[$(date)] Depth-capped BAM exists; skipping coverage analysis."
+        if [[ "$RUN_FIXMATE" == true ]]; then
           FIXMATE_NS="${SAMPLE_DIR}/${sample}.depthcapped.namesorted.bam"
           FIXMATE_NS_OUT="${SAMPLE_DIR}/${sample}.depthcapped.fixmate.namesorted.bam"
           FIXMATE_CS="${SAMPLE_DIR}/${sample}.depthcapped.fixmate.coordsorted.bam"
@@ -704,12 +739,16 @@ PYCODE
               samtools fixmate -m -@ "$THREADS" "$FIXMATE_NS" "$FIXMATE_NS_OUT"
               samtools sort -@ "$THREADS" -o "$FIXMATE_CS" "$FIXMATE_NS_OUT"
               samtools index "$FIXMATE_CS"
+              BAM="$FIXMATE_CS"
           else
               echo "[$(date)] Fixmate already done on depthcapped; skipping."
           fi
 
-          BAM="$FIXMATE_CS"
-      fi
+        else
+          echo "[$(date)] No fixmate needed, using existing depth-capped BAM."
+          BAM="$subbam"
+        fi
+      fi  
 
       # ─── Extract mapped reads with conditional filtering ────────────────────────
       P1="$SAMPLE_DIR/${sample}.mapped_1.fastq.gz"
@@ -741,7 +780,7 @@ PYCODE
         rm -f "$P1" "$P2" "$U0"
 
         # 1) write out a temporary BAM with the chosen filter
-        samtools view -@ "$THREADS" -b $FILTER "$BAM" -o "${SAMPLE_DIR}/${sample}.filtered.tmp.bam"
+        samtools view -bh -@ "$THREADS" -b $FILTER "$BAM" -o "${SAMPLE_DIR}/${sample}.filtered.tmp.bam"
 
         # 2) name-sort that BAM (so fixmate can see both mates together)
         samtools sort -n -@ "$THREADS" \
