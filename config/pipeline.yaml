@@ -23,8 +23,8 @@ mapq: 0                    # minimum mapping quality (default: 0)
 assembler: spades    # change to "spades" to run SPAdes, or "megahit" to run MEGAHIT
 
 # 7. Soft-clipped read filtering
-filter_softclipped_reads: false
-min_softclip_bases: 20
+filter_softclipped_reads: false # or true
+min_softclip_bases: 20 # 'auto' or integer soft-clip length cutoff
 softclip_filter_mode: trim  # or "full"
 
 # 8. Computational resources

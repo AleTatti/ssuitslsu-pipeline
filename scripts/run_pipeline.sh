@@ -9,7 +9,7 @@ conda --version >/dev/null 2>&1 && echo "➤ Conda version: $(conda --version | 
                              || echo "⚠️  conda not found in PATH"
 # ──────────────────────────────────────────────────────────────────────────────
 
-
+export TMPDIR="/tmp"
 export PYTHONUNBUFFERED=1
 
 # build your log‐filename
@@ -43,7 +43,7 @@ Options:
                             Sheet name within the taxonomy file
       --ref-fasta FILE      Reference FASTA for mapping/indexing
       --filter-softclip     Enable filtering of soft‐clipped reads
-      --min-softclip N        Override minimum soft-clip bases
+      --min-softclip N        Override 'auto' or integer soft-clip length cutoff
       --softclip-mode MODE    Override soft-clip filter mode (full|trim)
       --auto-subsample [true|false] Override auto_subsample behavior
       --max-cov N             Override max_coverage threshold
@@ -414,8 +414,8 @@ for fp in "$READS_DIR"/*; do
             --detect_adapter_for_pe \
             --length_required 70 \
             --thread "$THREADS" \
-            --html "$SAMPLE_DIR/${sample}_fastp.html" \
-            --json "$SAMPLE_DIR/${sample}_fastp.json"
+            --html /dev/null \
+            --json /dev/null
 
           # after trimming, point R1/R2 at the new files
           R1="$out_fw"
@@ -454,6 +454,7 @@ for fp in "$READS_DIR"/*; do
         rm -f "$BAM" "${BAM}.bai" "$LOG"
 
         # ─── Do the mapping inside a subshell so exec 4<> is scoped ──────────────
+
         echo "[$(date)] Mapping paired and unpaired reads (MAPQ ≥ $MAPQ)"
         (
           # redirect FD-4 to the log
@@ -483,150 +484,159 @@ for fp in "$READS_DIR"/*; do
 
       # fail early if no alignments
       [[ ! -s "$BAM" ]] && echo "!! Empty BAM; skipping sample" && continue 2
-      
-      # Only do soft-clip filtering/trimming if the flag is set
-      if [[ $FILTER_SOFTCLIP == true ]]; then
 
-        # ─── Soft‐clip statistics + IGV BAM ─────────────────────────────────────────
-        SC_DIR="$SAMPLE_DIR/chimera/softclipped_reads"
-        mkdir -p "$SC_DIR"
-        STAT_FILE="$SC_DIR/${sample}_softclip_stats.txt"
-        echo "[$(date)] Soft-clip anaysis starts..."
 
-        if [[ -f "$STAT_FILE" ]]; then
-          echo "[$(date)] Soft‐clip stats already present; skipping computation"
+       # ─── Soft-clip statistics (auto or user) ────────────────────────────────
+      SC_DIR="$SAMPLE_DIR/chimera/softclipped_reads"
+      mkdir -p "$SC_DIR"   # ensure output directory exists
+      STAT_FILE="$SC_DIR/${sample}_softclip_stats.txt"
+      echo "[$(date)] Soft-clip stats phase starts…"
+
+      # remember what the user originally asked for
+      ORIG_MIN="$MIN_SOFTCLIP"
+
+      # if we already have a stats file, skip recomputing
+      if [[ -f "$STAT_FILE" ]]; then
+        echo "[$(date)] Soft-clip stats already present; skipping stats pass"
+      else
+        # decide whether to pass “auto” or the numeric threshold
+        if [[ "$ORIG_MIN" == "auto" ]]; then
+          STATS_ARG="auto"
+          echo "[$(date)] Computing soft-clip stats (min=auto)" > "$STAT_FILE"
         else
-          echo "[$(date)] Soft-clip stats computation starts..."
-          # 1) Total mapped reads
-          total_reads=$(samtools view -@ "$THREADS" -c "$BAM")
-          echo "Total mapped reads: $total_reads" > "$STAT_FILE"
-
-          # 2) Count reads with ≥MIN_SOFTCLIP soft-clipped bases (no big SAM dump)
-          softclip_reads=$(samtools view -@ "$THREADS" -h "$BAM" \
-            | awk -v min="$MIN_SOFTCLIP" '
-                BEGIN { cnt = 0 }
-                /^@/ { next }
-                {
-                  cigar = $6
-                  while (match(cigar, /[0-9]+S/)) {
-                    num = substr(cigar, RSTART, RLENGTH-1) + 0
-                    if (num >= min) { cnt++; break }
-                    cigar = substr(cigar, RSTART + RLENGTH)
-                  }
-                }
-                END { print cnt }
-              ')
-          # 3) Compute percentage
-          pct=$(awk -v s="$softclip_reads" -v t="$total_reads" \
-                'BEGIN { printf("%.2f", t>0 ? s*100/t : 0) }')
-
-          echo "Reads with ≥${MIN_SOFTCLIP} soft-clipped bases: $softclip_reads ($pct%)" \
-            >> "$STAT_FILE"
+          STATS_ARG="$ORIG_MIN"
+          echo "[$(date)] Computing soft-clip stats (min=$ORIG_MIN)" > "$STAT_FILE"
         fi
 
-        # ─── Build IGV BAM of reads with ≥MIN_SOFTCLIP soft-clips ───────────────────
-        SC_BAM="$SC_DIR/${sample}.softclipped.sorted.bam"
-        if [[ ! -f "$SC_BAM" ]]; then
-          echo "[$(date)] Extracting reads with ≥${MIN_SOFTCLIP} soft-clips for IGV…"
-          samtools view -@ "$THREADS" -h "$BAM" \
-            | awk -v min="$MIN_SOFTCLIP" 'BEGIN{OFS="\t"}
-                /^@/ { print; next }
-                {
-                  cigar = $6; keep = 0
-                  while (match(cigar, /[0-9]+S/)) {
-                    if (substr(cigar, RSTART, RLENGTH-1)+0 >= min) { keep = 1; break }
-                    cigar = substr(cigar, RSTART + RLENGTH)
-                  }
-                  if (keep) print
-                }' \
-            | samtools view -b -@ "$THREADS" -o "$SC_DIR/${sample}.softclipped.bam" -
-          samtools sort -@ "$THREADS" -o "$SC_BAM" "$SC_DIR/${sample}.softclipped.bam"
-          samtools index "$SC_BAM"
-        fi
-        echo "[$(date)] Soft-clip stats computation end"
-        # ────────────────────────────────────────────────────────────────────────────
-        # If already processed, skip soft-clip and fixmate steps
+        # run the Python stats helper and append its output
+        "$PYTHON_EXE" scripts/parallel_softclip_filter.py \
+          -i "$BAM" \
+          -o "$SC_DIR" \
+          -m "$STATS_ARG" \
+          -t "$THREADS" \
+          --mode stats \
+        | tee -a "$STAT_FILE"
+      fi
+
+      # grab the auto‐computed threshold (90th percentile) for later
+      AUTO_MIN=$( grep '^Auto MIN_SOFTCLIP:' "$STAT_FILE" \
+        | awk '{print $3}' \
+        || { echo "!! Warning: no Auto MIN_SOFTCLIP found, defaulting to $MIN_SOFTCLIP" >&2; echo "$MIN_SOFTCLIP"; })
+
+      if [[ -z "$AUTO_MIN" ]]; then
+        echo "!! Failed to parse Auto MIN_SOFTCLIP from stats" >&2
+        exit 1
+      fi
+
+      # if the user wanted auto, override MIN_SOFTCLIP; otherwise keep theirs
+      if [[ "$ORIG_MIN" == "auto" ]]; then
+        MIN_SOFTCLIP=$AUTO_MIN
+        echo "[$(date)] Auto-set MIN_SOFTCLIP=$MIN_SOFTCLIP"
+      else
+        echo "[$(date)] Using user-supplied MIN_SOFTCLIP=$ORIG_MIN"
+        MIN_SOFTCLIP=$ORIG_MIN
+      fi
+
+      echo "[$(date)] Soft-clip stats phase ends (min=$MIN_SOFTCLIP)"
+
+      # ─── Build IGV BAM of soft-clipped reads ─────────────────
+      SC_DIR="$SAMPLE_DIR/chimera/softclipped_reads"
+      mkdir -p "$SC_DIR"
+      SC_OUT="$SC_DIR/${sample}.softclipped.sorted.bam"
+
+      if [[ ! -f "$SC_OUT" ]]; then
+        echo "[$(date)] Extracting soft-clipped reads into per-bucket BAMs…"
+        "$PYTHON_EXE" scripts/parallel_softclip_filter.py \
+          -i "$BAM" \
+          -o "$SC_DIR" \
+          -m "$MIN_SOFTCLIP" \
+          -t "$THREADS" \
+          --mode igv
+
+        echo "[$(date)] Merging and sorting IGV BAM…"
+        # merge all the bucket BAMs, then one sort+index
+        samtools merge -@ "$THREADS" -u -f - "$SC_DIR"/igv_*.bam \
+          | samtools sort -@ "$THREADS" -o "$SC_OUT" -
+        samtools index "$SC_OUT"
+
+        echo "[$(date)] Cleaning up temporary IGV BAM chunks…"
+        rm "$SC_DIR"/igv_*.bam
+      fi
+
+
+      # ─── Only perform soft-clip filtering/trimming if the flag is enabled ────
+      if [[ $FILTER_SOFTCLIP == true ]]; then
+        echo "[$(date)] filter_softclipped_reads = $FILTER_SOFTCLIP"
+        echo "[$(date)] min_softclip_bases       = $MIN_SOFTCLIP"
+        echo "[$(date)] softclip_filter_mode     = $SOFTCLIP_MODE"
+
+        # check if we already produced a fixmate’d BAM
         CS_BAM="$SAMPLE_DIR/${sample}.fixmate.bam"
         if [[ -f "$CS_BAM" ]]; then
           echo "[$(date)] $CS_BAM already exists; skipping soft-clip and mate-fixing."
           BAM="$CS_BAM"
         else
-          # If filtering is enabled, either remove entire reads or trim the ends
-          echo "[$(date)] filter_softclipped_reads = $FILTER_SOFTCLIP"
-          echo "[$(date)] min_softclip_bases       = $MIN_SOFTCLIP"
-          echo "[$(date)] softclip_filter_mode     = $SOFTCLIP_MODE"
+          # ─── Perform the chosen soft-clip operation ────────────────────────
+          if [[ "$SOFTCLIP_MODE" == "full" || "$SOFTCLIP_MODE" == "trim" ]]; then
+            if [[ "$SOFTCLIP_MODE" == "full" ]]; then
+              if [[ "$ORIG_MIN" == "auto" ]]; then
+                echo "[$(date)] Removing entire reads with ≥${MIN_SOFTCLIP} (auto threshold) soft-clips…"
+              else
+                echo "[$(date)] Removing entire reads with ≥${MIN_SOFTCLIP} soft-clips…"
+              fi
+            else
+              if [[ "$ORIG_MIN" == "auto" ]]; then
+                echo "[$(date)] Trimming soft-clipped ends when total clip ≥${MIN_SOFTCLIP} (auto threshold)…"
+              else
+                echo "[$(date)] Trimming soft-clipped ends when total clip ≥${MIN_SOFTCLIP}…"
+              fi
+            fi
 
-          # ─── 1) Soft-clip filtering or trimming ───────────────────────────────
-          if [[ "$SOFTCLIP_MODE" == "full" ]]; then
-            echo "[$(date)] Removing entire reads with ≥${MIN_SOFTCLIP} soft‐clips…"
             PROCESSED_BAM="$SAMPLE_DIR/${sample}.filtered.softclip.bam"
-            samtools view -@ "$THREADS" -h "$BAM" \
-              | awk -v min="$MIN_SOFTCLIP" 'BEGIN { OFS = "\t" }
-                  /^@/ { print; next }
-                  {
-                    cigar = $6; keep = 1
-                    while (match(cigar, /[0-9]+S/)) {
-                      num = substr(cigar, RSTART, RLENGTH-1)
-                      if (num >= min) { keep = 0; break }
-                      cigar = substr(cigar, RSTART + RLENGTH)
-                    }
-                    if (keep) print
-                  }' \
-              | samtools view -@ "$THREADS" -bS -o "$PROCESSED_BAM"
 
-          elif [[ "$SOFTCLIP_MODE" == "trim" ]]; then
-            echo "[$(date)] Trimming soft-clipped ends when min_clip>=${MIN_SOFTCLIP} …"
-            TRIM_UNSORTED="$SAMPLE_DIR/${sample}.trimmed_softclip.unsorted.bam"
-            "${PYTHON_EXE}" <<PYCODE
-import pysam
-in_bam   = "${BAM}"
-out_bam  = "${TRIM_UNSORTED}"
-min_clip = ${MIN_SOFTCLIP}
+            # 1) Extract and save the SAM header
+            samtools view -@ "$THREADS" -H "$BAM" > "$SC_DIR/header.sam"
 
-bam_in   = pysam.AlignmentFile(in_bam, "rb")
-bam_out  = pysam.AlignmentFile(out_bam, "wb", template=bam_in)
+            # 2) Launch Python filter/trimmer in parallel
+            "$PYTHON_EXE" scripts/parallel_softclip_filter.py \
+              -i "$BAM" \
+              -o "$SC_DIR" \
+              -m "$MIN_SOFTCLIP" \
+              -t "$THREADS" \
+              --mode "$SOFTCLIP_MODE"
 
-for r in bam_in.fetch(until_eof=True):
-    if r.cigartuples:
-        left  = r.cigartuples[0][1] if r.cigartuples[0][0] == 4 else 0
-        right = r.cigartuples[-1][1] if r.cigartuples[-1][0] == 4 else 0
-        if (left + right) >= min_clip:
-            seq, qual = r.query_sequence, r.query_qualities
-            if left or right:
-                r.query_sequence  = seq[left:len(seq)-right]
-                r.query_qualities = qual[left:len(qual)-right]
-            r.cigartuples = [(op, ln) for op, ln in r.cigartuples if op != 4]
-    bam_out.write(r)
+            # 3) Merge header + filtered SAM fragments, convert to BAM
+            cat "$SC_DIR/header.sam" "$SC_DIR"/filter_"$SOFTCLIP_MODE"_*.sam \
+              | samtools view -@ "$THREADS" -bS -o "$PROCESSED_BAM" -
 
-bam_out.close()
-bam_in.close()
-PYCODE
-            PROCESSED_BAM="$TRIM_UNSORTED"
-          fi  # end SOFTCLIP_MODE
+            rm "$SC_DIR/header.sam" "$SC_DIR"/filter_"$SOFTCLIP_MODE"_*.sam
 
-          # Point $BAM at the filtered/trimmed file
-          BAM="$PROCESSED_BAM"
-          echo "[$(date)] Soft‐clip step done; now fixing pairing flags on $BAM"
+            BAM="$PROCESSED_BAM"
+            echo "[$(date)] Soft-clip step done; downstream BAM is $BAM"
+          fi
 
-          # ─── 2) Name-sort → fixmate → coord-sort → index ───────────────────────
+          # ─── Fix pairing/info flags and sort/index ───────────────────────────
           echo "[$(date)] Fixing mate flags on ${BAM} …"
           NS_BAM="$SAMPLE_DIR/${sample}.fix.ns.bam"
           FM_BAM="$SAMPLE_DIR/${sample}.fixmate.ns.bam"
 
+          # name-sort for fixmate
           samtools sort -n -@ "$THREADS" -o "$NS_BAM" "$BAM"
+          # fix mate-pair tags
           samtools fixmate -m -@ "$THREADS" "$NS_BAM" "$FM_BAM"
+          # drop unpaired, coordinate-sort, and index final
           samtools view -@ "$THREADS" -b -F 4 "$FM_BAM" \
             | samtools sort -@ "$THREADS" -o "$CS_BAM"
           samtools index "$CS_BAM"
 
-          # cleanup intermediates
-          rm -f "$NS_BAM" "$FM_BAM" "$TRIM_UNSORTED"
+          rm -f "$NS_BAM" "$FM_BAM"
 
           BAM="$CS_BAM"
           echo "[$(date)] Finished fixmate; downstream BAM is $BAM"
-        fi  # end FILTER_SOFTCLIP
-        echo "[$(date)] Soft-clip analysis ends"  
-      fi  # end already-processed check
+        fi  # end existing-CS_BAM check
+
+        echo "[$(date)] Soft-clip analysis ends"
+      fi  # end FILTER_SOFTCLIP guard
       
 
       # ─── Coverage check + optional capping  ──────────────────────────────────────

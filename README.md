@@ -64,7 +64,7 @@ target_coverage: 90          # Target (×) coverage after subsampling
 mapq: 0                      # Minimum MAPQ to retain alignments (samtools -q)
 # Soft-clipped read filtering
 filter_softclipped_reads: false    # Enable filtering of soft-clipped reads
-min_softclip_bases: 10             # Minimum number of soft-clipped bases to trigger filtering
+min_softclip_bases: 10             # 'auto' for automatic or integer minimum number of soft-clipped bases to trigger filtering
 softclip_filter_mode: trim         # Options: "full" (remove entire read) or "trim" (trim softclipped ends only)
 # Assembly
 assembler: spades           # Options: "spades" or "megahit"
