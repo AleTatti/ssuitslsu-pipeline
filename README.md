@@ -73,6 +73,8 @@ threads: 8                  # Number of threads to use
 mem_gb: 16                  # Total RAM in GB
 # Output
 outdir: "results"
+# Phylogenetic analysis
+skip_phylogeny: true  # if true, skip IQ-TREE phylogenetic inference for faster run
 ```
 
 ---
@@ -144,6 +146,9 @@ Usage: `run_pipeline.sh [OPTIONS]`
 
 - `--taxonomy-sheet SHEET`  
   Sheet name within taxonomy file
+
+- `--skip_phylogeny [true|false]`  
+  Override skip_phylogeny behavior
 
 - `--ref-fasta FILE`  
   Reference FASTA for mapping/indexing

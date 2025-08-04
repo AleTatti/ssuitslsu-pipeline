@@ -1,56 +1,61 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 parallel_softclip_filter.py
 
-Parallel soft-clip analysis and filtering with cluster support + percentile cutoff.
+rDNA-specific soft-clip analysis and filtering for fungal short reads.
+
+Optimized for:
+- Fungal 45S rDNA (highly repetitive, low MAPQ expected)
+- Short reads (100-300bp) after fastp preprocessing
+- ITS region length variation (real biology vs artifacts)
+
+Key Logic:
+- Uses sequence composition, base quality, and read-pair consistency instead of MAPQ
+- Cluster-supported clips = likely real ITS variation (KEEP)
+- Low-quality isolated clips = likely sequencing artifacts (REMOVE/TRIM)
 
 Modes:
-  stats : compute and report detailed stats (total segments, cluster count,
-          distribution stats, count≥threshold, percent≥threshold, auto-threshold)
-  igv   : extract reads with ≥threshold soft-clips into per-bucket BAMs for IGV
-  full  : remove reads whose soft-clips meet the chosen threshold at supported positions
-  trim  : trim soft-clipped ends meeting the chosen threshold at supported positions
-
+  stats : compute detailed quality metrics and auto-threshold
+  full  : remove reads with low-quality artifactual soft-clips
+  trim  : trim low-quality soft-clipped ends while preserving real variation
+  igv   : create visualization BAMs with quality tags
 
 Usage examples:
-  # 1) Stats with auto threshold:
+  # 1) Analyze rDNA soft-clip patterns:
   parallel_softclip_filter.py -i input.bam -o outdir -m auto -t 16 --mode stats
 
-  # 2) Full removal at numeric threshold:
-  parallel_softclip_filter.py -i input.bam -o outdir -m 108 -t 16 --mode full
+  # 2) Remove artifactual clips:
+  parallel_softclip_filter.py -i input.bam -o outdir -m auto -t 16 --mode full
 
-  # 3) Trim with auto threshold:
+  # 3) Trim artifactual clips (recommended):
   parallel_softclip_filter.py -i input.bam -o outdir -m auto -t 16 --mode trim
 
-  # 4) Build IGV BAM chunks:
-  parallel_softclip_filter.py -i input.bam -o outdir -m 30 -t 16 --mode igv
+  # 4) IGV visualization:
+  parallel_softclip_filter.py -i input.bam -o outdir -m auto -t 16 --mode igv
 """
 import os
 import sys
 import argparse
 import statistics
-from collections import Counter
+import itertools
+from collections import Counter, defaultdict
 from multiprocessing import Pool
 import pysam
 
 
 def parse_args():
-    """
-    Parse command-line arguments:
-      -i/--input       : input BAM file path
-      -o/--outdir      : output directory for SAM/BAM chunks or stats
-      -m/--min_softclip: 'auto' or integer soft-clip length cutoff
-      -t/--threads     : number of parallel threads
-      --mode           : one of 'stats','full','trim','igv'
-    """
-    p = argparse.ArgumentParser(description="Soft-clip filter/trimmer/stats/IGV export")
+    """Parse command-line arguments."""
+    p = argparse.ArgumentParser(
+        description="rDNA-specific soft-clip filter for fungal short reads"
+    )
     p.add_argument('-i','--input', required=True, help="Input BAM file")
-    p.add_argument('-o','--outdir', required=True, help="Output directory for chunks or stats")
-    p.add_argument('-m','--min_softclip', required=True,
-                   help="'auto' or integer soft-clip length cutoff")
+    p.add_argument('-o','--outdir', required=True, help="Output directory")
+    p.add_argument('-m','--min_softclip', default='auto',
+                   help="Always uses automatic quality-based thresholds")
     p.add_argument('-t','--threads', type=int, default=1, help="Parallel threads")
     p.add_argument('--mode', choices=['stats','full','trim','igv'], default='stats',
-                   help="Operation mode: stats|full|trim|igv")
+                   help="Operation mode")
     return p.parse_args()
 
 
@@ -65,140 +70,460 @@ def assign_buckets(contigs, lengths, n_buckets):
     return buckets
 
 
+def calculate_sequence_complexity(seq):
+    """Calculate linguistic complexity of sequence (0-1 scale)."""
+    if len(seq) < 4:
+        return 0.0
+
+    # Count unique k-mers (k=3)
+    kmers = set()
+    for i in range(len(seq) - 2):
+        kmers.add(seq[i:i+3])
+
+    # Complexity = observed unique kmers / theoretical maximum
+    max_possible = min(64, len(seq) - 2)  # 4^3 = 64 possible 3-mers
+    return len(kmers) / max_possible if max_possible > 0 else 0.0
+
+
+def analyze_homopolymers(seq):
+    """Find longest homopolymer run in sequence."""
+    if not seq:
+        return 0
+    max_run = max(len(list(group)) for _, group in itertools.groupby(seq))
+    return max_run
+
+
+def calculate_gc_content(seq):
+    """Calculate GC content (0-1 scale)."""
+    if not seq:
+        return 0.5
+    gc_count = seq.count('G') + seq.count('C')
+    return gc_count / len(seq)
+
+
+def calculate_clip_quality_score(read, clip_start, clip_end, clip_seq):
+    """
+    Calculate quality score for a soft-clipped region (0-100 scale).
+
+    For rDNA short reads, focuses on:
+    - Sequence composition (GC, complexity, homopolymers)
+    - Base quality in clipped region
+    - Read pair consistency
+    """
+    score = 0
+
+    # 1. Sequence composition analysis (50% weight)
+    if clip_seq:
+        # GC content (should be reasonable, not extreme)
+        gc_content = calculate_gc_content(clip_seq)
+        if 0.3 <= gc_content <= 0.7:  # Reasonable range for fungal rDNA
+            score += 20
+        elif 0.2 <= gc_content <= 0.8:  # Acceptable range
+            score += 10
+
+        # Sequence complexity (avoid simple repeats)
+        complexity = calculate_sequence_complexity(clip_seq)
+        if complexity >= 0.6:  # High complexity
+            score += 20
+        elif complexity >= 0.4:  # Medium complexity
+            score += 10
+
+        # Homopolymer runs (sequencing artifacts common in homopolymers)
+        max_homopoly = analyze_homopolymers(clip_seq)
+        if max_homopoly <= 4:  # Short homopolymers OK
+            score += 10
+        elif max_homopoly <= 6:  # Medium homopolymers
+            score += 5
+
+    # 2. Base quality in clipped region (30% weight)
+    if read.query_qualities and clip_start < len(read.query_qualities):
+        end_pos = min(clip_end, len(read.query_qualities))
+        clip_qualities = read.query_qualities[clip_start:end_pos]
+        if clip_qualities:
+            mean_qual = statistics.mean(clip_qualities)
+            if mean_qual >= 25:  # High quality
+                score += 30
+            elif mean_qual >= 20:  # Medium quality
+                score += 20
+            elif mean_qual >= 15:  # Low but acceptable
+                score += 10
+
+    # 3. Read pair information (20% weight)
+    if read.is_paired:
+        # Proper pair orientation
+        if read.is_proper_pair:
+            score += 10
+
+        # Reasonable insert size (adjust for your library)
+        if read.template_length != 0:
+            insert_size = abs(read.template_length)
+            if 100 <= insert_size <= 800:  # Typical short-read library range
+                score += 10
+            elif 50 <= insert_size <= 1200:  # Extended acceptable range
+                score += 5
+
+    return min(score, 100)  # Cap at 100
+
+
 def stats_bucket(args):
     """
-    Collect clip positions and lengths for stats. Returns:
-      total reads,
-      list of (pos,length) for all clips ≥ min_len,
-      left-only count, right-only count, both-ends count,
-      sum MAPQ all reads, sum MAPQ clipped reads
+    Collect detailed clip statistics with quality scores.
+    Returns: total_reads, clip_records, read_stats
     """
     bucket, bam_path, min_len = args
     total = 0
-    left_only = right_only = both = 0
-    mapq_all = mapq_clip = 0
-    records = []
+    clip_records = []  # (pos, length, is_left, quality_score, read_id)
+    read_stats = {
+        'clipped_reads': 0,
+        'total_mapq': 0,
+        'left_only': 0,
+        'right_only': 0,
+        'both_ends': 0,
+        'high_quality_clips': 0,
+        'low_quality_clips': 0
+    }
+
     bam = pysam.AlignmentFile(bam_path, 'rb')
+
     for ctg in bucket:
-        for r in bam.fetch(ctg):
+        for read in bam.fetch(ctg):
             total += 1
-            mapq_all += r.mapping_quality
-            if not r.cigartuples:
+            read_stats['total_mapq'] += read.mapping_quality
+
+            if not read.cigartuples:
                 continue
-            left = r.cigartuples[0][1] if r.cigartuples[0][0] == 4 else 0
-            right = r.cigartuples[-1][1] if r.cigartuples[-1][0] == 4 else 0
-            if left or right:
-                if left >= min_len:
-                    records.append((r.reference_start, left))
-                    mapq_clip += r.mapping_quality
-                if right >= min_len:
-                    records.append((r.reference_end, right))
-                    mapq_clip += r.mapping_quality
-                if left and right:
-                    both += 1
-                elif left:
-                    left_only += 1
+
+            # Analyze soft-clips
+            left_clip = read.cigartuples[0][1] if read.cigartuples[0][0] == 4 else 0
+            right_clip = read.cigartuples[-1][1] if read.cigartuples[-1][0] == 4 else 0
+
+            if not (left_clip or right_clip):
+                continue
+
+            read_stats['clipped_reads'] += 1
+
+            # Classify clipping pattern
+            if left_clip and right_clip:
+                read_stats['both_ends'] += 1
+            elif left_clip:
+                read_stats['left_only'] += 1
+            else:
+                read_stats['right_only'] += 1
+
+            # Analyze left clip
+            if left_clip >= min_len:
+                clip_seq = read.query_sequence[:left_clip] if read.query_sequence else ""
+                quality_score = calculate_clip_quality_score(read, 0, left_clip, clip_seq)
+
+                clip_records.append((
+                    read.reference_start, left_clip, True, quality_score, read.query_name
+                ))
+
+                if quality_score >= 60:
+                    read_stats['high_quality_clips'] += 1
                 else:
-                    right_only += 1
+                    read_stats['low_quality_clips'] += 1
+
+            # Analyze right clip
+            if right_clip >= min_len and read.query_sequence:
+                clip_seq = read.query_sequence[-right_clip:]
+                seq_len = len(read.query_sequence)
+                quality_score = calculate_clip_quality_score(
+                    read, seq_len - right_clip, seq_len, clip_seq
+                )
+
+                clip_records.append((
+                    read.reference_end, right_clip, False, quality_score, read.query_name
+                ))
+
+                if quality_score >= 60:
+                    read_stats['high_quality_clips'] += 1
+                else:
+                    read_stats['low_quality_clips'] += 1
+
     bam.close()
-    return total, records, left_only, right_only, both, mapq_all, mapq_clip
+    return total, clip_records, read_stats
 
 
 def compute_stats(bam_path, buckets, threads, min_initial=1):
-    """
-    Aggregate stats: cluster support + percentile, plus detailed counts.
-    Returns a dict with all metrics including 'clusters_set'.
-    """
+    """Aggregate statistics with rDNA-specific quality analysis."""
     tasks = [(buckets[i], bam_path, min_initial) for i in range(len(buckets))]
-    with Pool(threads) as p:
-        results = p.map(stats_bucket, tasks)
-    total = sum(r[0] for r in results)
-    all_records = [rec for r in results for rec in r[1]]
-    left_only = sum(r[2] for r in results)
-    right_only = sum(r[3] for r in results)
-    both = sum(r[4] for r in results)
-    mapq_all = sum(r[5] for r in results)
-    mapq_clip = sum(r[6] for r in results)
 
-    # cluster support: positions with ≥2 reads
-    pos_counts = Counter(pos for pos, _ in all_records)
-    clusters = {pos for pos, c in pos_counts.items() if c >= 2}
-    cluster_lengths = [ln for pos, ln in all_records if pos in clusters]
+    with Pool(threads) as pool:
+        results = pool.map(stats_bucket, tasks)
 
-    if cluster_lengths:
-        mean_clip = statistics.mean(cluster_lengths)
-        median_clip = statistics.median(cluster_lengths)
-        pct90 = statistics.quantiles(cluster_lengths, n=100)[89]
+    # Aggregate results
+    total_reads = sum(r[0] for r in results)
+    all_clips = []
+    for r in results:
+        all_clips.extend(r[1])
+
+    # Aggregate read stats
+    combined_stats = defaultdict(int)
+    for _, _, read_stats in results:
+        for key, value in read_stats.items():
+            combined_stats[key] += value
+
+    # Analyze clustering with quality awareness
+    position_clips = defaultdict(list)  # (pos, is_left) -> [quality_scores]
+    quality_scores = [clip[3] for clip in all_clips]
+    clip_lengths = [clip[1] for clip in all_clips]
+
+    for pos, length, is_left, quality, read_id in all_clips:
+        position_clips[(pos, is_left)].append((quality, length))
+
+    # Define clusters: positions with ≥2 reads AND average quality ≥ 50
+    clusters = {}
+    high_quality_clusters = {}
+
+    for (pos, is_left), quality_lengths in position_clips.items():
+        if len(quality_lengths) >= 2:  # Cluster support
+            avg_quality = statistics.mean([ql[0] for ql in quality_lengths])
+            avg_length = statistics.mean([ql[1] for ql in quality_lengths])
+
+            clusters[(pos, is_left)] = {
+                'count': len(quality_lengths),
+                'avg_quality': avg_quality,
+                'avg_length': avg_length,
+                'lengths': [ql[1] for ql in quality_lengths]
+            }
+
+            if avg_quality >= 50:  # High-quality cluster
+                high_quality_clusters[(pos, is_left)] = clusters[(pos, is_left)]
+
+    # Calculate thresholds
+    if clip_lengths:
+        # Use multiple approaches for threshold
+        median_length = statistics.median(clip_lengths)
+        pct75_length = statistics.quantiles(clip_lengths, n=4)[2] if len(clip_lengths) >= 4 else median_length
+
+        # For rDNA, use a more conservative approach
+        # Focus on quality rather than just length
+        high_qual_lengths = [length for _, length, _, quality, _ in all_clips if quality >= 60]
+        if high_qual_lengths:
+            hq_median = statistics.median(high_qual_lengths)
+            auto_thresh = max(10, min(int(hq_median * 0.8), 50))  # Conservative for short reads
+        else:
+            auto_thresh = max(10, int(pct75_length * 0.6))
     else:
-        mean_clip = median_clip = pct90 = 0
+        auto_thresh = 15  # Default for short reads
 
-    auto_thresh = int(pct90)
-    soft_count = sum(1 for ln in cluster_lengths if ln >= auto_thresh)
-    soft_pct = soft_count / total * 100 if total else 0
-    avg_mapq_all = mapq_all / total if total else 0
-    avg_mapq_clip = mapq_clip / soft_count if soft_count else 0
+    # Count clips by category
+    total_clips = len(all_clips)
+    clustered_clips = sum(1 for clip in all_clips
+                         if (clip[0], clip[2]) in clusters and clip[1] >= auto_thresh)
+    isolated_clips = sum(1 for clip in all_clips
+                        if (clip[0], clip[2]) not in clusters and clip[1] >= auto_thresh)
 
     return {
-        'total': total,
+        'total_reads': total_reads,
+        'total_clips': total_clips,
+        'clipped_reads': combined_stats['clipped_reads'],
         'clusters': len(clusters),
-        'mean_clip': mean_clip,
-        'median_clip': median_clip,
-        'pct90': pct90,
-        'left_only': left_only,
-        'right_only': right_only,
-        'both': both,
+        'high_quality_clusters': len(high_quality_clusters),
+        'clustered_clips': clustered_clips,
+        'isolated_clips': isolated_clips,
+        'high_quality_clips': combined_stats['high_quality_clips'],
+        'low_quality_clips': combined_stats['low_quality_clips'],
+        'left_only': combined_stats['left_only'],
+        'right_only': combined_stats['right_only'],
+        'both_ends': combined_stats['both_ends'],
+        'avg_mapq': combined_stats['total_mapq'] / total_reads if total_reads else 0,
         'auto_thresh': auto_thresh,
-        'soft_count': soft_count,
-        'soft_pct': soft_pct,
-        'avg_mapq_all': avg_mapq_all,
-        'avg_mapq_clip': avg_mapq_clip,
-        'clusters_set': clusters,
-        'cluster_lengths': cluster_lengths
+        'median_length': statistics.median(clip_lengths) if clip_lengths else 0,
+        'mean_quality': statistics.mean(quality_scores) if quality_scores else 0,
+        'clusters_dict': clusters,
+        'high_quality_clusters_dict': high_quality_clusters
     }
 
 
 def filter_bucket(args):
-    """Filter or trim reads based on threshold + support clusters."""
+    """Filter/trim reads based on quality-aware clustering with detailed statistics."""
     bucket, bam_path, outdir, threshold, clusters, mode, idx = args
     out_sam = os.path.join(outdir, f'filter_{mode}_{idx}.sam')
+    
+    # Statistics counters
+    stats = {
+        'reads_processed': 0,
+        'reads_with_clips': 0,
+        'reads_removed': 0,          # For full mode
+        'reads_modified': 0,         # For trim mode
+        'reads_kept_unchanged': 0,
+        'left_clips_analyzed': 0,
+        'right_clips_analyzed': 0,
+        'left_clips_removed': 0,     # Full: entire read removed, Trim: clip trimmed
+        'right_clips_removed': 0,
+        'left_clips_preserved': 0,   # High-quality or clustered clips kept
+        'right_clips_preserved': 0,
+        'total_bp_trimmed': 0,       # Only for trim mode
+        'total_reads_trimmed_left': 0,
+        'total_reads_trimmed_right': 0
+    }
+
     bam = pysam.AlignmentFile(bam_path, 'rb')
+
     with open(out_sam, 'w') as out:
         for ctg in bucket:
-            for r in bam.fetch(ctg):
-                keep = True
-                if r.cigartuples:
-                    left = r.cigartuples[0][1] if r.cigartuples[0][0] == 4 else 0
-                    right = r.cigartuples[-1][1] if r.cigartuples[-1][0] == 4 else 0
-                    cond = ((left >= threshold and r.reference_start in clusters) or
-                            (right >= threshold and r.reference_end in clusters))
-                    if cond:
-                        if mode == 'full':
-                            keep = False
-                        else:  # trim
-                            seq = r.query_sequence or ''
-                            qual = r.query_qualities or []
-                            r.query_sequence = seq[left:len(seq)-right]
-                            r.query_qualities = qual[left:len(qual)-right]
-                            r.cigartuples = [(op, ln) for op, ln in r.cigartuples if op != 4]
-                if keep:
-                    out.write(r.to_string() + "\n")
+            for read in bam.fetch(ctg):
+                stats['reads_processed'] += 1
+                
+                if not read.cigartuples:
+                    out.write(read.to_string() + "\n")
+                    continue
+
+                left_clip = read.cigartuples[0][1] if read.cigartuples[0][0] == 4 else 0
+                right_clip = read.cigartuples[-1][1] if read.cigartuples[-1][0] == 4 else 0
+
+                if left_clip or right_clip:
+                    stats['reads_with_clips'] += 1
+
+                # Analyze clip quality and clustering
+                remove_left = False
+                remove_right = False
+
+                if left_clip >= threshold:
+                    stats['left_clips_analyzed'] += 1
+                    clip_seq = read.query_sequence[:left_clip] if read.query_sequence else ""
+                    quality_score = calculate_clip_quality_score(read, 0, left_clip, clip_seq)
+
+                    cluster_key = (read.reference_start, True)
+                    if quality_score < 50 and cluster_key not in clusters:
+                        remove_left = True
+                        stats['left_clips_removed'] += 1
+                    else:
+                        stats['left_clips_preserved'] += 1
+
+                if right_clip >= threshold and read.query_sequence:
+                    stats['right_clips_analyzed'] += 1
+                    seq_len = len(read.query_sequence)
+                    clip_seq = read.query_sequence[-right_clip:]
+                    quality_score = calculate_clip_quality_score(
+                        read, seq_len - right_clip, seq_len, clip_seq
+                    )
+
+                    cluster_key = (read.reference_end, False)
+                    if quality_score < 50 and cluster_key not in clusters:
+                        remove_right = True
+                        stats['right_clips_removed'] += 1
+                    else:
+                        stats['right_clips_preserved'] += 1
+
+                if mode == 'full':
+                    # Skip reads with low-quality clips
+                    if remove_left or remove_right:
+                        stats['reads_removed'] += 1
+                        continue
+                    else:
+                        stats['reads_kept_unchanged'] += 1
+                        out.write(read.to_string() + "\n")
+
+                elif mode == 'trim':
+                    # Trim only low-quality clips
+                    if remove_left or remove_right:
+                        stats['reads_modified'] += 1
+                        seq = read.query_sequence or ''
+                        qual = read.query_qualities or []
+                        new_cigar = list(read.cigartuples)
+
+                        trim_left = left_clip if remove_left else 0
+                        trim_right = right_clip if remove_right else 0
+
+                        if trim_left:
+                            stats['total_reads_trimmed_left'] += 1
+                            stats['total_bp_trimmed'] += trim_left
+                        if trim_right:
+                            stats['total_reads_trimmed_right'] += 1
+                            stats['total_bp_trimmed'] += trim_right
+
+                        if trim_left or trim_right:
+                            # Update sequence and quality
+                            end_pos = len(seq) - trim_right if trim_right else len(seq)
+                            read.query_sequence = seq[trim_left:end_pos]
+                            if qual:
+                                read.query_qualities = qual[trim_left:end_pos]
+
+                            # Update CIGAR
+                            if trim_left and new_cigar[0][0] == 4:
+                                new_left = left_clip - trim_left
+                                if new_left > 0:
+                                    new_cigar[0] = (4, new_left)
+                                else:
+                                    new_cigar = new_cigar[1:]
+
+                            if trim_right and new_cigar and new_cigar[-1][0] == 4:
+                                new_right = right_clip - trim_right
+                                if new_right > 0:
+                                    new_cigar[-1] = (4, new_right)
+                                else:
+                                    new_cigar = new_cigar[:-1]
+
+                            read.cigartuples = new_cigar
+                    else:
+                        stats['reads_kept_unchanged'] += 1
+
+                    out.write(read.to_string() + "\n")
+
     bam.close()
+    return stats
 
 
 def igv_bucket(args):
-    """
-    Write a BAM of all soft-clipped reads for IGV per bucket.
-    Outputs one BAM: igv_{idx}.bam
-    """
-    bucket, bam_path, outdir, min_clip, idx = args
+    """Create IGV BAM with quality and cluster tags."""
+    bucket, bam_path, outdir, threshold, clusters, idx = args
     out_bam = os.path.join(outdir, f'igv_{idx}.bam')
+
     bam_in = pysam.AlignmentFile(bam_path, 'rb')
-    bam_out = pysam.AlignmentFile(out_bam,   'wb', template=bam_in)
+    bam_out = pysam.AlignmentFile(out_bam, 'wb', template=bam_in)
+
     for ctg in bucket:
-        for r in bam_in.fetch(ctg):
-            # include any read with at least one soft-clip, regardless of length
-            if r.cigartuples and any(op == 4 for op, ln in r.cigartuples):
-                bam_out.write(r)
+        for read in bam_in.fetch(ctg):
+            if not read.cigartuples or not any(op == 4 for op, _ in read.cigartuples):
+                continue
+
+            left_clip = read.cigartuples[0][1] if read.cigartuples[0][0] == 4 else 0
+            right_clip = read.cigartuples[-1][1] if read.cigartuples[-1][0] == 4 else 0
+
+            # Add quality tags
+            if left_clip > 0:
+                clip_seq = read.query_sequence[:left_clip] if read.query_sequence else ""
+                quality_score = calculate_clip_quality_score(read, 0, left_clip, clip_seq)
+                cluster_key = (read.reference_start, True)
+
+                if quality_score >= 60:
+                    read.set_tag('XL', 'high_quality')
+                elif quality_score >= 30:
+                    read.set_tag('XL', 'medium_quality')
+                else:
+                    read.set_tag('XL', 'low_quality')
+
+                if cluster_key in clusters:
+                    read.set_tag('CL', 'clustered')
+                else:
+                    read.set_tag('CL', 'isolated')
+
+            if right_clip > 0:
+                seq_len = len(read.query_sequence) if read.query_sequence else 0
+                clip_seq = read.query_sequence[-right_clip:] if read.query_sequence else ""
+                quality_score = calculate_clip_quality_score(
+                    read, seq_len - right_clip, seq_len, clip_seq
+                )
+                cluster_key = (read.reference_end, False)
+
+                if quality_score >= 60:
+                    read.set_tag('XR', 'high_quality')
+                elif quality_score >= 30:
+                    read.set_tag('XR', 'medium_quality')
+                else:
+                    read.set_tag('XR', 'low_quality')
+
+                if cluster_key in clusters:
+                    read.set_tag('CR', 'clustered')
+                else:
+                    read.set_tag('CR', 'isolated')
+
+            read.set_tag('QT', threshold)  # Quality threshold used
+            bam_out.write(read)
+
     bam_in.close()
     bam_out.close()
 
@@ -207,59 +532,152 @@ def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
-    # build contig buckets once
+    # Build contig buckets
     bam = pysam.AlignmentFile(args.input, 'rb')
     buckets = assign_buckets(bam.references, bam.lengths, args.threads)
     bam.close()
 
-    # ─── stats mode ──────────────────────────────────────────────────────────
+    # ─── STATS MODE ──────────────────────────────────────────────────────────
     if args.mode == 'stats':
         stats = compute_stats(args.input, buckets, args.threads)
-        print(f"Total mapped segments: {stats['total']}")
-        print(f"Soft-clipped segments ≥{stats['auto_thresh']}: {stats['soft_count']} ({stats['soft_pct']:.2f}%)")
-        print(f"Mean clip length: {stats['mean_clip']:.1f}")
-        print(f"Median clip length: {stats['median_clip']}")
-        print(f"90th pct clip length: {stats['pct90']}")
-        print(f"Clipped ends (left/right/both): {stats['left_only']}/{stats['right_only']}/{stats['both']}")
-        print(f"Avg MAPQ (all/soft): {stats['avg_mapq_all']:.1f}/{stats['avg_mapq_clip']:.1f}")
+
+        print("=" * 60)
+        print("rDNA-SPECIFIC SOFT-CLIP ANALYSIS")
+        print("=" * 60)
+        print(f"Total mapped reads: {stats['total_reads']}")
+        print(f"Reads with soft-clips: {stats['clipped_reads']} ({stats['clipped_reads']/stats['total_reads']*100:.1f}%)")
+        print(f"Total soft-clip events: {stats['total_clips']}")
+        print()
+        print("CLIPPING PATTERNS:")
+        print(f"  Left-only clips: {stats['left_only']}")
+        print(f"  Right-only clips: {stats['right_only']}")
+        print(f"  Both-ends clips: {stats['both_ends']}")
+        print()
+        print("QUALITY ANALYSIS:")
+        print(f"  High-quality clips (≥60): {stats['high_quality_clips']}")
+        print(f"  Low-quality clips (<60): {stats['low_quality_clips']}")
+        print(f"  Average quality score: {stats['mean_quality']:.1f}")
+        print()
+        print("CLUSTERING ANALYSIS:")
+        print(f"  Total cluster positions: {stats['clusters']}")
+        print(f"  High-quality clusters: {stats['high_quality_clusters']}")
+        print(f"  Clustered clips ≥{stats['auto_thresh']}bp: {stats['clustered_clips']}")
+        print(f"  Isolated clips ≥{stats['auto_thresh']}bp: {stats['isolated_clips']}")
+        print()
+        print("SUMMARY METRICS:")
+        print(f"  Median clip length: {stats['median_length']:.1f}bp")
+        print(f"  Average MAPQ: {stats['avg_mapq']:.1f} (expected low for rDNA)")
+        print(f"  Auto-threshold: {stats['auto_thresh']}bp")
+        print()
+        print("RECOMMENDATION:")
+        if stats['isolated_clips'] > stats['clustered_clips']:
+            print("  → Many isolated clips detected - consider 'trim' mode to clean artifacts")
+        else:
+            print("  → Most clips are clustered - likely real ITS variation")
+
         sys.exit(0)
 
-    # ─── full/trim modes ─────────────────────────────────────────────────────
+    # ─── FILTER/TRIM MODES ───────────────────────────────────────────────────
     if args.mode in ('full', 'trim'):
         stats = compute_stats(args.input, buckets, args.threads)
-        # choose threshold: auto or user-provided
-        if str(args.min_softclip).lower() == 'auto':
-            threshold = stats['auto_thresh']
-            print(f"Auto threshold used: {threshold}")
-        else:
-            threshold = int(args.min_softclip)
-            count_user = sum(1 for ln in stats['cluster_lengths'] if ln >= threshold)
-            pct_user = count_user / stats['total'] * 100 if stats['total'] else 0
-            print(f"Soft-clipped segments ≥{threshold}: {count_user} ({pct_user:.2f}%)")
-            print(f"Auto MIN_SOFTCLIP: {stats['auto_thresh']}")
-        clusters = stats['clusters_set']
 
-        # dispatch parallel filtering/trimming
+        threshold = stats['auto_thresh']
+        print(f"Using automatic quality-based threshold: {threshold}bp")
+
+        clusters = stats['high_quality_clusters_dict']
+        print(f"Using {len(clusters)} high-quality cluster positions for filtering")
+
         tasks = [
             (buckets[i], args.input, args.outdir, threshold, clusters, args.mode, i)
             for i in range(len(buckets))
         ]
+
         with Pool(args.threads) as pool:
-            pool.map(filter_bucket, tasks)
+            bucket_stats = pool.map(filter_bucket, tasks)
+
+        # Aggregate statistics from all buckets
+        total_stats = {
+            'reads_processed': sum(s['reads_processed'] for s in bucket_stats),
+            'reads_with_clips': sum(s['reads_with_clips'] for s in bucket_stats),
+            'reads_removed': sum(s['reads_removed'] for s in bucket_stats),
+            'reads_modified': sum(s['reads_modified'] for s in bucket_stats),
+            'reads_kept_unchanged': sum(s['reads_kept_unchanged'] for s in bucket_stats),
+            'left_clips_analyzed': sum(s['left_clips_analyzed'] for s in bucket_stats),
+            'right_clips_analyzed': sum(s['right_clips_analyzed'] for s in bucket_stats),
+            'left_clips_removed': sum(s['left_clips_removed'] for s in bucket_stats),
+            'right_clips_removed': sum(s['right_clips_removed'] for s in bucket_stats),
+            'left_clips_preserved': sum(s['left_clips_preserved'] for s in bucket_stats),
+            'right_clips_preserved': sum(s['right_clips_preserved'] for s in bucket_stats),
+            'total_bp_trimmed': sum(s['total_bp_trimmed'] for s in bucket_stats),
+            'total_reads_trimmed_left': sum(s['total_reads_trimmed_left'] for s in bucket_stats),
+            'total_reads_trimmed_right': sum(s['total_reads_trimmed_right'] for s in bucket_stats)
+        }
+
+        # Report detailed statistics
+        print()
+        print("=" * 60)
+        print(f"{args.mode.upper()} MODE STATISTICS")
+        print("=" * 60)
+        print(f"Reads processed: {total_stats['reads_processed']:,}")
+        print(f"Reads with soft-clips: {total_stats['reads_with_clips']:,} ({total_stats['reads_with_clips']/total_stats['reads_processed']*100:.1f}%)")
+        print()
+        print("CLIP ANALYSIS:")
+        print(f"  Left clips analyzed (≥{threshold}bp): {total_stats['left_clips_analyzed']:,}")
+        print(f"  Right clips analyzed (≥{threshold}bp): {total_stats['right_clips_analyzed']:,}")
+        print(f"  Total clips analyzed: {total_stats['left_clips_analyzed'] + total_stats['right_clips_analyzed']:,}")
+        print()
+        
+        if args.mode == 'full':
+            print("REMOVAL STATISTICS:")
+            print(f"  Reads removed (low-quality clips): {total_stats['reads_removed']:,} ({total_stats['reads_removed']/total_stats['reads_processed']*100:.1f}%)")
+            print(f"  Reads kept unchanged: {total_stats['reads_kept_unchanged']:,} ({total_stats['reads_kept_unchanged']/total_stats['reads_processed']*100:.1f}%)")
+            print(f"  Left clips causing removal: {total_stats['left_clips_removed']:,}")
+            print(f"  Right clips causing removal: {total_stats['right_clips_removed']:,}")
+            
+        elif args.mode == 'trim':
+            print("TRIMMING STATISTICS:")
+            print(f"  Reads with clips trimmed: {total_stats['reads_modified']:,} ({total_stats['reads_modified']/total_stats['reads_processed']*100:.1f}%)")
+            print(f"  Reads kept unchanged: {total_stats['reads_kept_unchanged']:,} ({total_stats['reads_kept_unchanged']/total_stats['reads_processed']*100:.1f}%)")
+            print(f"  Left clips trimmed: {total_stats['left_clips_removed']:,} from {total_stats['total_reads_trimmed_left']:,} reads")
+            print(f"  Right clips trimmed: {total_stats['right_clips_removed']:,} from {total_stats['total_reads_trimmed_right']:,} reads")
+            print(f"  Total basepairs trimmed: {total_stats['total_bp_trimmed']:,} bp")
+            if total_stats['total_bp_trimmed'] > 0:
+                avg_trim = total_stats['total_bp_trimmed'] / (total_stats['left_clips_removed'] + total_stats['right_clips_removed'])
+                print(f"  Average trim length: {avg_trim:.1f} bp")
+
+        print()
+        print("PRESERVATION STATISTICS:")
+        print(f"  Left clips preserved (high-quality/clustered): {total_stats['left_clips_preserved']:,}")
+        print(f"  Right clips preserved (high-quality/clustered): {total_stats['right_clips_preserved']:,}")
+        total_preserved = total_stats['left_clips_preserved'] + total_stats['right_clips_preserved']
+        total_analyzed = total_stats['left_clips_analyzed'] + total_stats['right_clips_analyzed']
+        if total_analyzed > 0:
+            print(f"  Overall preservation rate: {total_preserved}/{total_analyzed} ({total_preserved/total_analyzed*100:.1f}%)")
+
+        print(f"\nFiltered {args.mode} SAM files created in {args.outdir}")
         sys.exit(0)
 
-    # ─── igv mode ────────────────────────────────────────────────────────────
+    # ─── IGV MODE ─────────────────────────────────────────────────────────────
     if args.mode == 'igv':
+        stats = compute_stats(args.input, buckets, args.threads)
+
+        threshold = stats['auto_thresh']
+        clusters = stats['high_quality_clusters_dict']
+
         tasks = [
-            (buckets[i], args.input, args.outdir, args.min_softclip, i)
+            (buckets[i], args.input, args.outdir, threshold, clusters, i)
             for i in range(len(buckets))
         ]
+
         with Pool(args.threads) as pool:
             pool.map(igv_bucket, tasks)
+
+        print(f"IGV BAM files created with quality tags:")
+        print(f"  XL/XR: left/right clip quality (high/medium/low)")
+        print(f"  CL/CR: left/right cluster status (clustered/isolated)")
+        print(f"  QT: quality threshold used ({threshold})")
         sys.exit(0)
 
-    # unknown mode
-    raise ValueError(f"Unknown mode: {args.mode}")
 
 if __name__ == '__main__':
     main()
