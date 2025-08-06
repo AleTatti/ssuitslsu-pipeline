@@ -341,7 +341,7 @@ def filter_bucket(args):
     """Filter/trim reads based on quality-aware clustering with detailed statistics."""
     bucket, bam_path, outdir, threshold, clusters, mode, idx = args
     out_sam = os.path.join(outdir, f'filter_{mode}_{idx}.sam')
-    
+
     # Statistics counters
     stats = {
         'reads_processed': 0,
@@ -366,7 +366,7 @@ def filter_bucket(args):
         for ctg in bucket:
             for read in bam.fetch(ctg):
                 stats['reads_processed'] += 1
-                
+
                 if not read.cigartuples:
                     out.write(read.to_string() + "\n")
                     continue
@@ -541,39 +541,8 @@ def main():
     if args.mode == 'stats':
         stats = compute_stats(args.input, buckets, args.threads)
 
-        print("=" * 60)
-        print("rDNA-SPECIFIC SOFT-CLIP ANALYSIS")
-        print("=" * 60)
-        print(f"Total mapped reads: {stats['total_reads']}")
-        print(f"Reads with soft-clips: {stats['clipped_reads']} ({stats['clipped_reads']/stats['total_reads']*100:.1f}%)")
-        print(f"Total soft-clip events: {stats['total_clips']}")
-        print()
-        print("CLIPPING PATTERNS:")
-        print(f"  Left-only clips: {stats['left_only']}")
-        print(f"  Right-only clips: {stats['right_only']}")
-        print(f"  Both-ends clips: {stats['both_ends']}")
-        print()
-        print("QUALITY ANALYSIS:")
-        print(f"  High-quality clips (≥60): {stats['high_quality_clips']}")
-        print(f"  Low-quality clips (<60): {stats['low_quality_clips']}")
-        print(f"  Average quality score: {stats['mean_quality']:.1f}")
-        print()
-        print("CLUSTERING ANALYSIS:")
-        print(f"  Total cluster positions: {stats['clusters']}")
-        print(f"  High-quality clusters: {stats['high_quality_clusters']}")
-        print(f"  Clustered clips ≥{stats['auto_thresh']}bp: {stats['clustered_clips']}")
-        print(f"  Isolated clips ≥{stats['auto_thresh']}bp: {stats['isolated_clips']}")
-        print()
-        print("SUMMARY METRICS:")
-        print(f"  Median clip length: {stats['median_length']:.1f}bp")
-        print(f"  Average MAPQ: {stats['avg_mapq']:.1f} (expected low for rDNA)")
-        print(f"  Auto-threshold: {stats['auto_thresh']}bp")
-        print()
-        print("RECOMMENDATION:")
-        if stats['isolated_clips'] > stats['clustered_clips']:
-            print("  → Many isolated clips detected - consider 'trim' mode to clean artifacts")
-        else:
-            print("  → Most clips are clustered - likely real ITS variation")
+        print(f"Soft-clip analysis: {stats['clipped_reads']}/{stats['total_reads']} reads ({stats['clipped_reads']/stats['total_reads']*100:.1f}%) with clips")
+        print(f"Auto-threshold: {stats['auto_thresh']}bp (median: {stats['median_length']:.1f}bp)")
 
         sys.exit(0)
 
@@ -614,41 +583,12 @@ def main():
         }
 
         # Report detailed statistics
-        print()
-        print("=" * 60)
-        print(f"{args.mode.upper()} MODE STATISTICS")
-        print("=" * 60)
-        print(f"Reads processed: {total_stats['reads_processed']:,}")
-        print(f"Reads with soft-clips: {total_stats['reads_with_clips']:,} ({total_stats['reads_with_clips']/total_stats['reads_processed']*100:.1f}%)")
-        print()
-        print("CLIP ANALYSIS:")
-        print(f"  Left clips analyzed (≥{threshold}bp): {total_stats['left_clips_analyzed']:,}")
-        print(f"  Right clips analyzed (≥{threshold}bp): {total_stats['right_clips_analyzed']:,}")
-        print(f"  Total clips analyzed: {total_stats['left_clips_analyzed'] + total_stats['right_clips_analyzed']:,}")
-        print()
-        
         if args.mode == 'full':
-            print("REMOVAL STATISTICS:")
-            print(f"  Reads removed (low-quality clips): {total_stats['reads_removed']:,} ({total_stats['reads_removed']/total_stats['reads_processed']*100:.1f}%)")
-            print(f"  Reads kept unchanged: {total_stats['reads_kept_unchanged']:,} ({total_stats['reads_kept_unchanged']/total_stats['reads_processed']*100:.1f}%)")
-            print(f"  Left clips causing removal: {total_stats['left_clips_removed']:,}")
-            print(f"  Right clips causing removal: {total_stats['right_clips_removed']:,}")
-            
+            print(f"Filtered: {total_stats['reads_removed']:,}/{total_stats['reads_processed']:,} reads ({total_stats['reads_removed']/total_stats['reads_processed']*100:.1f}%) removed")
         elif args.mode == 'trim':
-            print("TRIMMING STATISTICS:")
-            print(f"  Reads with clips trimmed: {total_stats['reads_modified']:,} ({total_stats['reads_modified']/total_stats['reads_processed']*100:.1f}%)")
-            print(f"  Reads kept unchanged: {total_stats['reads_kept_unchanged']:,} ({total_stats['reads_kept_unchanged']/total_stats['reads_processed']*100:.1f}%)")
-            print(f"  Left clips trimmed: {total_stats['left_clips_removed']:,} from {total_stats['total_reads_trimmed_left']:,} reads")
-            print(f"  Right clips trimmed: {total_stats['right_clips_removed']:,} from {total_stats['total_reads_trimmed_right']:,} reads")
-            print(f"  Total basepairs trimmed: {total_stats['total_bp_trimmed']:,} bp")
-            if total_stats['total_bp_trimmed'] > 0:
-                avg_trim = total_stats['total_bp_trimmed'] / (total_stats['left_clips_removed'] + total_stats['right_clips_removed'])
-                print(f"  Average trim length: {avg_trim:.1f} bp")
+            print(f"Trimmed: {total_stats['reads_modified']:,}/{total_stats['reads_processed']:,} reads ({total_stats['reads_modified']/total_stats['reads_processed']*100:.1f}%) modified")
 
-        print()
-        print("PRESERVATION STATISTICS:")
-        print(f"  Left clips preserved (high-quality/clustered): {total_stats['left_clips_preserved']:,}")
-        print(f"  Right clips preserved (high-quality/clustered): {total_stats['right_clips_preserved']:,}")
+        print(f"Preservation rate: {(total_stats['left_clips_preserved'] + total_stats['right_clips_preserved'])/(total_stats['left_clips_analyzed'] + total_stats['right_clips_analyzed'])*100:.1f}%")
         total_preserved = total_stats['left_clips_preserved'] + total_stats['right_clips_preserved']
         total_analyzed = total_stats['left_clips_analyzed'] + total_stats['right_clips_analyzed']
         if total_analyzed > 0:

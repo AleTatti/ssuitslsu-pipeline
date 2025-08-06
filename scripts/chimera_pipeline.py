@@ -423,8 +423,7 @@ def main():
                 filtered.append(SeqRecord(Seq(new_seq), id=rec.id, description=""))
             pair_aln = MultipleSeqAlignment(filtered)
 
-            # ─── DEBUG #1: show pair_aln length ───────────────────────────────
-            #print(f"[PLOT DEBUG] {sid}: pair_aln length = {pair_aln.get_alignment_length()}")
+
 
 
             seq1_pw = str(pair_aln[0].seq)
@@ -459,8 +458,7 @@ def main():
                 ax.set_visible(False)
                 continue
 
-            # ─── DEBUG #2: confirm axes selection ───────────────────────────────
-            #print(f"[PLOT DEBUG] plotting on axes[{row}][{col}] for {sid}")
+
 
 
             # 3) shade ITSx regions on the *pairwise* alignment (using regions_pair)

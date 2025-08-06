@@ -1,10 +1,10 @@
 # config/pipeline.yaml
 
 # 1. Where your raw sequencing reads live
-reads_dir: "/path/to/raw_reads"
+reads_dir: "/Volumes/Alessia_4T/ALPFU_plates/raw_reads"
 
 # 2. Taxonomy spreadsheet (Excel .xlsx or .csv BOLD format)
-taxonomy_file: "/path/to/your_taxonomy.xlsx"
+taxonomy_file: "/Users/utente/Desktop/PhD/BGE_ALPFUNGI/BOLD_ALPFU_Taxonomy.xlsx"
 taxonomy_sheet: "Taxonomy" #Taxonomy sheet of the spreadsheet
 
 # 3. Reference database (FASTA of SSU, ITS, LSU sequences) # ref_fasta is auto-downloaded if unset
@@ -21,16 +21,16 @@ auto_subsample: true # Enable automatic coverage management
 #target_coverage: 100      # More aggressive: reduce to 100×
 mapq: 0 # minimum mapping quality (default: 0)
 
-# 6. Assembler
+# 6. Soft-clipped read filtering
+filter_softclipped_reads: true # set to true to filter reads with soft-clipped bases
+softclip_filter_mode: full # full = remove entire read, trim = remove softclip only
+
+# 7. Assembler
 assembler: spades # change to "spades" to run SPAdes, or "megahit" to run MEGAHIT
 
-# 7. Soft-clipped read filtering
-filter_softclipped_reads: false # or true
-softclip_filter_mode: trim # or "full"
-
 # 8. Computational resources
-threads: 8 # e.g. number of CPU cores to use
-mem_gb: 16 # e.g. total RAM in GB
+threads: 16 # e.g. number of CPU cores to use
+mem_gb: 32 # e.g. total RAM in GB
 
 # 9. Where to put all output
 outdir: "results"

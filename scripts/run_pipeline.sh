@@ -3,26 +3,334 @@
 set -euo pipefail
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Version checks
-echo "➤ Bash version: $BASH_VERSION"
-conda --version >/dev/null 2>&1 && echo "➤ Conda version: $(conda --version | cut -d' ' -f2)" \
-                             || echo "⚠️  conda not found in PATH"
+# Portability and OS Detection
 # ──────────────────────────────────────────────────────────────────────────────
 
-export TMPDIR="/tmp"
+# Detect OS for compatibility
+case "$(uname -s)" in
+    Darwin*) OS="mac" ;;
+    Linux*)  OS="linux" ;;
+    CYGWIN*|MINGW*|MSYS*) OS="windows" ;;
+    *) echo "ERROR: Unsupported OS: $(uname -s)" >&2; exit 1 ;;
+esac
+
+# Portable file size function
+get_file_size() {
+    local file="$1"
+    if [[ "$OS" == "mac" ]]; then
+        stat -f%z "$file" 2>/dev/null || echo "0"
+    else
+        stat -c%s "$file" 2>/dev/null || echo "0"
+    fi
+}
+
+# Portable sed in-place editing
+sed_inplace() {
+    if [[ "$OS" == "mac" ]]; then
+        sed -i '' "$@"
+    else
+        sed -i "$@"
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dependency Management and Environment Handling
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Check if required tools are available
+check_dependencies() {
+    local missing=()
+    command -v conda >/dev/null || missing+=("conda")
+    command -v curl >/dev/null || missing+=("curl")
+    command -v unzip >/dev/null || missing+=("unzip")
+    command -v awk >/dev/null || missing+=("awk")
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "ERROR: Missing required tools: ${missing[*]}" >&2
+        echo "Please install the missing tools and try again." >&2
+        exit 1
+    fi
+}
+
+# Verify conda environment exists before activation
+activate_env() {
+    local env_name="$1"
+    if conda env list | grep -q "^${env_name} "; then
+        set +u
+        conda activate "$env_name"
+        set -u
+    else
+        echo "ERROR: Conda environment '$env_name' not found." >&2
+        echo "Please run: conda env create -f envs/$(echo "$env_name" | sed 's/ssuitslsu-//')yaml" >&2
+        exit 1
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Error Handling and Cleanup
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Global cleanup function
+cleanup() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        echo "[$(date)] Pipeline failed with exit code $exit_code" >&2
+        echo "[$(date)] Cleaning up temporary files..." >&2
+    fi
+
+    # Clean up any temporary files with our process ID
+    rm -f "${TMPDIR:-/tmp}"/ssuitslsu_$$_* 2>/dev/null || true
+
+    # Restore original stdout/stderr if redirected
+    if [[ -n "${ORIGINAL_STDOUT:-}" ]]; then
+        # Check if file descriptors 3 and 4 exist before trying to restore
+        if { true >&3; } 2>/dev/null && { true >&4; } 2>/dev/null; then
+            exec 1>&3 2>&4 3>&- 4>&- 2>/dev/null || true
+        fi
+    fi
+
+    exit $exit_code
+}
+trap cleanup EXIT INT TERM
+
+# Better error handling for critical steps
+run_with_retry() {
+    local max_attempts=3
+    local cmd=("$@")
+    local attempt=1
+
+    while [[ $attempt -le $max_attempts ]]; do
+        if "${cmd[@]}"; then
+            return 0
+        else
+            echo "Command failed (attempt $attempt/$max_attempts): ${cmd[*]}" >&2
+            if [[ $attempt -lt $max_attempts ]]; then
+                echo "Retrying in $((attempt * 5)) seconds..." >&2
+                sleep $((attempt * 5))
+            fi
+            ((attempt++))
+        fi
+    done
+
+    echo "ERROR: Command failed after $max_attempts attempts: ${cmd[*]}" >&2
+    return 1
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Input Validation Functions
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Validate FASTQ files
+validate_fastq() {
+    local file="$1"
+    local label="${2:-FASTQ}"
+
+    if [[ ! -f "$file" ]]; then
+        echo "ERROR: $label file not found: $file" >&2
+        return 1
+    fi
+
+    if [[ ! -s "$file" ]]; then
+        echo "ERROR: $label file is empty: $file" >&2
+        return 1
+    fi
+
+    # Check if file is properly formatted (first few lines)
+    local first_line
+    if [[ "$file" == *.gz ]]; then
+        first_line=$(zcat "$file" 2>/dev/null | head -1 || echo "")
+    else
+        first_line=$(head -1 "$file" 2>/dev/null || echo "")
+    fi
+
+    if [[ ! "$first_line" =~ ^@ ]]; then
+        echo "ERROR: Invalid FASTQ format (no @ header): $file" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# Validate taxonomy file
+validate_taxonomy() {
+    local tax_file="$1"
+    local sheet="$2"
+
+    if [[ ! -f "$tax_file" ]]; then
+        echo "ERROR: Taxonomy file not found: $tax_file" >&2
+        return 1
+    fi
+
+    # Check file extension and basic content
+    case "${tax_file##*.}" in
+        xlsx|xls)
+            # Temporarily activate taxo environment for Excel validation
+            local current_env="$CONDA_DEFAULT_ENV"
+            if conda env list | grep -q "^ssuitslsu-taxo "; then
+                set +u
+                conda activate ssuitslsu-taxo
+                set -u
+
+                if ! python3 -c "
+import pandas as pd
+try:
+    df = pd.read_excel('$tax_file', sheet_name='$sheet', header=1, nrows=1)
+    if 'Sample ID' not in df.columns:
+        raise ValueError('Missing Sample ID column')
+except Exception as e:
+    print(f'ERROR: {e}', file=__import__('sys').stderr)
+    exit(1)
+" 2>/dev/null; then
+                    # Restore previous environment
+                    if [[ -n "$current_env" ]]; then
+                        set +u
+                        conda activate "$current_env"
+                        set -u
+                    fi
+                    echo "ERROR: Cannot read Excel file '$tax_file' sheet '$sheet' or missing 'Sample ID' column" >&2
+                    return 1
+                fi
+
+                # Restore previous environment
+                if [[ -n "$current_env" ]]; then
+                    set +u
+                    conda activate "$current_env"
+                    set -u
+                fi
+            else
+                echo "WARNING: ssuitslsu-taxo environment not found, skipping Excel validation" >&2
+                echo "         Excel file will be validated later during processing" >&2
+            fi
+            ;;
+        csv)
+            if ! head -1 "$tax_file" | grep -q "Sample ID"; then
+                echo "ERROR: CSV file missing 'Sample ID' column: $tax_file" >&2
+                return 1
+            fi
+            ;;
+        *)
+            echo "ERROR: Unsupported taxonomy file format: ${tax_file##*.}" >&2
+            echo "Supported formats: .xlsx, .xls, .csv" >&2
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+# Validate configuration file
+validate_config() {
+    local config="$1"
+
+    if [[ ! -f "$config" ]]; then
+        echo "ERROR: Configuration file not found: $config" >&2
+        return 1
+    fi
+
+    # Check required fields
+    local required_fields=(
+        "reads_dir" "taxonomy_file" "assembler"
+        "threads" "mem_gb" "outdir"
+    )
+
+    for field in "${required_fields[@]}"; do
+        if ! shyaml get-value "$field" < "$config" >/dev/null 2>&1; then
+            echo "ERROR: Missing required config field: $field" >&2
+            return 1
+        fi
+    done
+
+    # Validate numeric fields
+    local threads mem_gb
+    threads=$(shyaml get-value threads < "$config")
+    mem_gb=$(shyaml get-value mem_gb < "$config")
+
+    if ! [[ "$threads" =~ ^[0-9]+$ ]] || [[ $threads -lt 1 ]]; then
+        echo "ERROR: Invalid threads value (must be positive integer): $threads" >&2
+        return 1
+    fi
+
+    if ! [[ "$mem_gb" =~ ^[0-9]+$ ]] || [[ $mem_gb -lt 1 ]]; then
+        echo "ERROR: Invalid mem_gb value (must be positive integer): $mem_gb" >&2
+        return 1
+    fi
+
+    # Validate assembler choice
+    local assembler
+    assembler=$(shyaml get-value assembler < "$config")
+    if [[ "$assembler" != "spades" && "$assembler" != "megahit" ]]; then
+        echo "ERROR: Invalid assembler (must be 'spades' or 'megahit'): $assembler" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resource Management
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Check available resources
+check_resources() {
+    local required_mem_gb="$1"
+    local required_disk_gb="$2"
+    local target_dir="$3"
+
+    # Check memory (Linux only, warn on others)
+    if [[ "$OS" == "linux" && -f /proc/meminfo ]]; then
+        local available_mem
+        available_mem=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo 2>/dev/null || echo "0")
+        if [[ $available_mem -gt 0 && $available_mem -lt $required_mem_gb ]]; then
+            echo "WARNING: Available memory (${available_mem}GB) < requested (${required_mem_gb}GB)" >&2
+            echo "         Pipeline may fail or be slow. Consider reducing mem_gb in config." >&2
+        fi
+    fi
+
+    # Check disk space (cross-platform)
+    if command -v df >/dev/null; then
+        local available_disk
+        if [[ "$OS" == "mac" ]]; then
+            available_disk=$(df -g "$target_dir" 2>/dev/null | tail -1 | awk '{print int($4)}' || echo "999")
+        else
+            available_disk=$(df -BG "$target_dir" 2>/dev/null | tail -1 | awk '{gsub(/G/, "", $4); print int($4)}' || echo "999")
+        fi
+
+        if [[ $available_disk -lt $required_disk_gb ]]; then
+            echo "ERROR: Insufficient disk space in $target_dir" >&2
+            echo "       Available: ${available_disk}GB, Estimated needed: ${required_disk_gb}GB" >&2
+            exit 1
+        fi
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Version checks and initial setup
+# ──────────────────────────────────────────────────────────────────────────────
+
+echo "➤ Bash version: $BASH_VERSION"
+echo "➤ Operating System: $OS"
+
+# Check dependencies early
+check_dependencies
+
+conda --version >/dev/null 2>&1 && echo "➤ Conda version: $(conda --version | cut -d' ' -f2)" \
+                             || echo "⚠️  conda not found in PATH"
+
+export TMPDIR="${TMPDIR:-/tmp}"
 export PYTHONUNBUFFERED=1
 
 # build your log‐filename
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG="ssuitslsu_${TIMESTAMP}.log"
 # redirect all stdout+stderr into tee, which writes to both console and log
+exec 3>&1 4>&2
 exec > >(tee -a "$LOG") 2>&1
+ORIGINAL_STDOUT=1
 
 t_align_start=0
 t_align_end=0
 t_phylo_start=0
 t_phylo_end=0
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Usage/help message
@@ -53,9 +361,6 @@ Options:
   -h, --help                Show this help message and exit
 EOF
 }
-
-# ──────────────────────────────────────────────────────────────────────────────
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Initialize CLI-override vars with defaults
@@ -102,17 +407,29 @@ done
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Initialize Conda in non-interactive shells
-CONDA_BASE=$(conda info --base)
-source "$CONDA_BASE/etc/profile.d/conda.sh"
+CONDA_BASE=$(conda info --base 2>/dev/null) || {
+    echo "ERROR: Cannot determine conda base directory" >&2
+    exit 1
+}
+source "$CONDA_BASE/etc/profile.d/conda.sh" || {
+    echo "ERROR: Cannot source conda profile" >&2
+    exit 1
+}
 # ──────────────────────────────────────────────────────────────────────────────
 
 # 1) Activate utils environment for shyaml
-set +u
-conda activate ssuitslsu-utils
-set -u
+activate_env ssuitslsu-utils
 
-# 2) Load config
+# 2) Load and validate config
 CONFIG="$(dirname "$0")/../config/pipeline.yaml"
+
+if [[ ! -f "$CONFIG" ]]; then
+    echo "ERROR: Configuration file not found: $CONFIG" >&2
+    exit 1
+fi
+
+echo "[$(date)] Validating configuration..."
+validate_config "$CONFIG"
 
 READS_DIR=$(shyaml get-value reads_dir              < "$CONFIG")
 TAXONOMY_FILE=$(shyaml get-value taxonomy_file      < "$CONFIG")
@@ -140,7 +457,6 @@ if [[ -n "$MAX_COV" && -n "$TARGET_COV" ]]; then
     USER_SPECIFIED_COVERAGE=true
 fi
 
-
 # assembly
 ASSEMBLER=$(shyaml get-value assembler              < "$CONFIG")
 
@@ -154,13 +470,19 @@ MEM=$(shyaml get-value mem_gb                       < "$CONFIG")
 # output
 OUTDIR=$(shyaml get-value outdir                    < "$CONFIG")
 
-
 SKIP_TRIM="${SKIP_TRIM_RAW,,}"
 ASSEMBLER="${ASSEMBLER,,}"
 FILTER_SOFTCLIP="${FILTER_SOFTCLIP_RAW,,}"
 SOFTCLIP_MODE="${SOFTCLIP_MODE,,}"
 AUTO_SUBSAMPLE="${AUTO_SUBSAMPLE_RAW,,}"
 SKIP_PHYLO="${SKIP_PHYLO_RAW,,}"
+
+# Initialize MIN_SOFTCLIP based on mode
+if [[ "$SOFTCLIP_MODE" == "full" ]]; then
+    MIN_SOFTCLIP="auto"
+else
+    MIN_SOFTCLIP="auto"  # default to auto for all modes
+fi
 
 # ─── Apply CLI overrides (if provided) ────────────────────────────────────────
 [[ -n "${READS_DIR_CLI:-}"      ]] && READS_DIR="$READS_DIR_CLI"
@@ -194,21 +516,35 @@ fi
 
 [[ "${SKIP_PHYLO_CLI:-}" == "true" ]] && SKIP_PHYLO=true
 
-
 # ──────────────────────────────────────────────────────────────────────────────
-
 # fall back to defaults if not set in pipeline.yaml
 MAPQ=${MAPQ:-0}
 AUTO_SUBSAMPLE=${AUTO_SUBSAMPLE:-true}
 
 # Strip stray quotes (so paths with spaces work)
-for var in READS_DIR TAXONOMY_FILE REF_FASTA; do
+for var in READS_DIR TAXONOMY_FILE REF_FASTA OUTDIR; do
   val="${!var:-}"
   val="${val#\"}"; val="${val%\"}"
   val="${val#\'}"; val="${val%\'}"
   printf -v "$var" '%s' "$val"
 done
 
+echo "[$(date)] Validating inputs..."
+
+# ─── 3) Validate config ─────────────────────────────────────────────
+die(){ echo "ERROR: $*" >&2; exit 1; }
+
+# ensure reads / taxonomy / reference exist and are valid
+[[ -d "$READS_DIR" ]]  || die "reads_dir not found or not a directory: $READS_DIR"
+
+# Validate taxonomy file early
+validate_taxonomy "$TAXONOMY_FILE" "$TAXONOMY_SHEET"
+
+# Create output directory and check resources
+mkdir -p "$OUTDIR" || die "Cannot create output directory: $OUTDIR"
+
+# Check available resources (estimate 10GB needed per sample)
+check_resources "$MEM" 10 "$OUTDIR"
 
 echo "Starting ssuitslsu pipeline at $(date)"
 
@@ -236,6 +572,13 @@ fi
 # Check if user provided a custom reference database
 if [[ -n "$REF_FASTA" && -f "$REF_FASTA" ]]; then
   echo "[$(date)] Using user-provided reference: $REF_FASTA"
+  # Validate the reference file
+  if [[ ! -s "$REF_FASTA" ]]; then
+      die "Reference FASTA file is empty: $REF_FASTA"
+  fi
+  if ! head -1 "$REF_FASTA" | grep -q "^>"; then
+      die "Reference file does not appear to be valid FASTA format: $REF_FASTA"
+  fi
 else
   # Only download and process the eukaryome database if no custom reference is provided
   REF_FASTA="$FILTERED_FASTA"
@@ -244,10 +587,14 @@ else
   if [[ ! -f "$FILTERED_FASTA" ]] || [[ -f "$REFERENCE_REMOVE_FILE" && "$REFERENCE_REMOVE_FILE" -nt "$FILTERED_FASTA" ]]; then
     # Download and extract the database
     echo "[$(date)] Downloading Eukaryome database…"
-    curl -L "$ZIP_URL" -o "$ZIP_FILE"
+    run_with_retry curl -L "$ZIP_URL" -o "$ZIP_FILE"
 
     echo "[$(date)] Extracting FASTA from ZIP…"
-    unzip -p "$ZIP_FILE" "${DB_NAME}.fasta" > "$RAW_FASTA"
+    unzip -p "$ZIP_FILE" "${DB_NAME}.fasta" > "$RAW_FASTA" || {
+        echo "ERROR: Failed to extract FASTA from ZIP file" >&2
+        rm -f "$ZIP_FILE" "$RAW_FASTA"
+        exit 1
+    }
 
     echo "[$(date)] Filtering to k__Fungi, excluding mitochondrial sequences…"
     awk '
@@ -257,60 +604,56 @@ else
 
     # ─── Remove all "(Fungi)" from headers ────────────────────────────────────
     echo "[$(date)] Stripping \"(Fungi)\" suffix from genus names…"
-    sed -i'' -e 's/(Fungi)//g' "$FILTERED_FASTA"
+    sed_inplace 's/(Fungi)//g' "$FILTERED_FASTA"
     # ───────────────────────────────────────────────────────────────────────────
 
-    echo "[$(date)] Pruning out unwanted sequences listed in /data/references_to_be_removed.txt…"
-    awk '
-      BEGIN {
-        # read IDs (one per line, without the ">") into remove[]
-        while ((getline id < "'"$DATA_DIR"'/reference_to_be_removed.txt") > 0) {
-          # Extract just the ID part (before the first semicolon) from remove list
-          semicolon_pos = index(id, ";")
-          if (semicolon_pos > 0)
-            id = substr(id, 1, semicolon_pos - 1)
-          remove[id] = 1
-        }
-      }
-      /^>/ {
-        seq_id = substr($0, 2)
-        # Remove underscore prefix if present
-        if (substr(seq_id, 1, 1) == "_")
-          seq_id = substr(seq_id, 2)
-        # Extract just the ID part (before the first semicolon)
-        semicolon_pos = index(seq_id, ";")
-        if (semicolon_pos > 0)
-          seq_id = substr(seq_id, 1, semicolon_pos - 1)
-        skip = (seq_id in remove)
-        if (!skip) print
-        next
-      }
-      { if (!skip) print }
-    ' "$FILTERED_FASTA" > "${FILTERED_FASTA%.fasta}_pruned.fasta"
+    if [[ -f "$REFERENCE_REMOVE_FILE" ]]; then
+        echo "[$(date)] Pruning out unwanted sequences listed in $REFERENCE_REMOVE_FILE…"
+        awk '
+          BEGIN {
+            # read IDs (one per line, without the ">") into remove[]
+            while ((getline id < "'"$REFERENCE_REMOVE_FILE"'") > 0) {
+              # Extract just the ID part (before the first semicolon) from remove list
+              semicolon_pos = index(id, ";")
+              if (semicolon_pos > 0)
+                id = substr(id, 1, semicolon_pos - 1)
+              remove[id] = 1
+            }
+          }
+          /^>/ {
+            seq_id = substr($0, 2)
+            # Remove underscore prefix if present
+            if (substr(seq_id, 1, 1) == "_")
+              seq_id = substr(seq_id, 2)
+            # Extract just the ID part (before the first semicolon)
+            semicolon_pos = index(seq_id, ";")
+            if (semicolon_pos > 0)
+              seq_id = substr(seq_id, 1, semicolon_pos - 1)
+            skip = (seq_id in remove)
+            if (!skip) print
+            next
+          }
+          { if (!skip) print }
+        ' "$FILTERED_FASTA" > "${FILTERED_FASTA%.fasta}_pruned.fasta"
 
-    mv "${FILTERED_FASTA%.fasta}_pruned.fasta" "$FILTERED_FASTA"
+        mv "${FILTERED_FASTA%.fasta}_pruned.fasta" "$FILTERED_FASTA"
+    fi
 
     echo "[$(date)] Cleaning up temporary files…"
     rm -f "$ZIP_FILE" "$RAW_FASTA"
   fi
 fi
 
+# Final validation of reference
+[[ -f "$REF_FASTA" ]]  || die "ref_fasta not found after setup: $REF_FASTA"
+[[ -s "$REF_FASTA" ]]  || die "ref_fasta is empty: $REF_FASTA"
+
 # ─── Assembler default & validation ────────────────────────────────────────
 ASSEMBLER=${ASSEMBLER:-$(shyaml get-value assembler < "$CONFIG")}
-
 if [[ "$ASSEMBLER" != "spades" && "$ASSEMBLER" != "megahit" ]]; then
   echo "ERROR: --assembler must be 'spades' or 'megahit' (you passed '$ASSEMBLER')" >&2
   exit 1
 fi
-
-# ─── 3) Validate config ─────────────────────────────────────────────
-die(){ echo "ERROR: $*" >&2; exit 1; }
-
-# ensure reads / taxonomy / reference exist
-[[ -d "$READS_DIR" ]]  || die "reads_dir not found: $READS_DIR"
-[[ -f "$TAXONOMY_FILE" ]] || die "taxonomy file not found: $TAXONOMY_FILE"
-[[ -f "$REF_FASTA" ]]  || die "ref_fasta not found: $REF_FASTA"
-
 
 echo "Running with:"
 echo "  skip_trimming    = $SKIP_TRIM"
@@ -331,11 +674,9 @@ TAX_CSV="$OUTDIR/$(basename "${TAXONOMY_FILE%.*}").csv"
 
 # 4) Taxonomy conversion (auto-detect sheet & header) #only once
 if [[ ! -f "$TAX_CSV" || "$TAXONOMY_FILE" -nt "$TAX_CSV" ]]; then
-  set +u
-  conda activate ssuitslsu-taxo
-  set -u
-  echo "[`date`] Converting taxonomy → CSV"
- PYTHON_EXE="$CONDA_PREFIX/bin/python"
+  activate_env ssuitslsu-taxo
+  echo "[$(date)] Converting taxonomy → CSV"
+  PYTHON_EXE="$CONDA_PREFIX/bin/python"
   [[ ! -x "$PYTHON_EXE" ]] && PYTHON_EXE=python
 
   "$PYTHON_EXE" <<PYCODE
@@ -351,38 +692,43 @@ wanted     = [
 ]
 ext = os.path.splitext(tax_file)[1].lower()
 
-if ext in ('.xlsx','.xls'):
-    xlsx   = pd.ExcelFile(tax_file, engine='openpyxl')
-    sheets = xlsx.sheet_names
-    # exact match, else substring match, else first sheet
-    sheet = next((s for s in sheets if s.lower()==requested.lower()), None)
-    if sheet is None:
-        sheet = next((s for s in sheets if requested.lower() in s.lower()), sheets[0])
-        sys.stderr.write("Using sheet '%s'\\n" % sheet)
-    # read without header to find the header row where Sample ID appears in column A
-    raw = pd.read_excel(xlsx, sheet_name=sheet, header=None)
-    hdr = next((i for i,v in raw.iloc[:,0].astype(str).str.strip().items() if v=='Sample ID'), None)
-    if hdr is None:
-        raise ValueError("Cannot find header row with 'Sample ID'")
-    df = pd.read_excel(xlsx, sheet_name=sheet, header=hdr)
-elif ext == '.csv':
-    df = pd.read_csv(tax_file)
-elif ext in ('.tsv','.txt'):
-    df = pd.read_csv(tax_file, sep='\\t')
-else:
-    raise ValueError("Unsupported taxonomy extension: %s" % ext)
+try:
+    if ext in ('.xlsx','.xls'):
+        xlsx   = pd.ExcelFile(tax_file, engine='openpyxl')
+        sheets = xlsx.sheet_names
+        # exact match, else substring match, else first sheet
+        sheet = next((s for s in sheets if s.lower()==requested.lower()), None)
+        if sheet is None:
+            sheet = next((s for s in sheets if requested.lower() in s.lower()), sheets[0])
+            sys.stderr.write("Using sheet '%s'\\n" % sheet)
+        # read without header to find the header row where Sample ID appears in column A
+        raw = pd.read_excel(xlsx, sheet_name=sheet, header=None)
+        hdr = next((i for i,v in raw.iloc[:,0].astype(str).str.strip().items() if v=='Sample ID'), None)
+        if hdr is None:
+            raise ValueError("Cannot find header row with 'Sample ID'")
+        df = pd.read_excel(xlsx, sheet_name=sheet, header=hdr)
+    elif ext == '.csv':
+        df = pd.read_csv(tax_file)
+    elif ext in ('.tsv','.txt'):
+        df = pd.read_csv(tax_file, sep='\\t')
+    else:
+        raise ValueError("Unsupported taxonomy extension: %s" % ext)
 
-missing = [c for c in wanted if c not in df.columns]
-if missing:
-    raise ValueError("Missing columns: %s" % missing)
+    missing = [c for c in wanted if c not in df.columns]
+    if missing:
+        raise ValueError("Missing columns: %s" % missing)
 
-df[wanted].to_csv(out_csv, index=False)
+    df[wanted].to_csv(out_csv, index=False)
+    print("Successfully converted taxonomy to CSV")
+
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
 PYCODE
 
 else
-  echo "[`date`] Skipping taxonomy conversion (up to date)"
+  echo "[$(date)] Skipping taxonomy conversion (up to date)"
 fi
-
 # 5) Define read‐suffix arrays
 R1_SUFFIXES=(
   _1.fastq.gz _1.fastq _1.fq.gz _1.fq
@@ -593,23 +939,54 @@ for fp in "$READS_DIR"/*; do
       SC_DIR="$SAMPLE_DIR/chimera/softclipped_reads"
       mkdir -p "$SC_DIR"   # ensure output directory exists
       STAT_FILE="$SC_DIR/${sample}_softclip_stats.txt"
+      echo "[$(date)] Soft-clip stats phase starts…"
 
-      # Generate stats file for record-keeping (if not already present)
-      if [[ ! -f "$STAT_FILE" ]]; then
-        echo "[$(date)] Generating soft-clip statistics for record-keeping…"
-        echo "[$(date)] Computing soft-clip stats for $sample" > "$STAT_FILE"
+      # remember what the user originally asked for
+      ORIG_MIN="$MIN_SOFTCLIP"
+
+      # if we already have a stats file, skip recomputing
+      if [[ -f "$STAT_FILE" ]]; then
+        echo "[$(date)] Soft-clip stats already present; skipping stats pass"
+      else
+        # decide whether to pass “auto” or the numeric threshold
+        if [[ "$ORIG_MIN" == "auto" ]]; then
+          STATS_ARG="auto"
+          echo "[$(date)] Computing soft-clip stats (min=auto)" > "$STAT_FILE"
+        else
+          STATS_ARG="$ORIG_MIN"
+          echo "[$(date)] Computing soft-clip stats (min=$ORIG_MIN)" > "$STAT_FILE"
+        fi
 
         # run the Python stats helper and append its output
         "$PYTHON_EXE" scripts/parallel_softclip_filter.py \
           -i "$BAM" \
           -o "$SC_DIR" \
-          -m auto \
+          -m "$STATS_ARG" \
           -t "$THREADS" \
           --mode stats \
         | tee -a "$STAT_FILE"
-      else
-        echo "[$(date)] Soft-clip stats already present; skipping stats generation"
       fi
+
+      # grab the auto‐computed threshold (90th percentile) for later
+      AUTO_MIN=$( grep '^Auto MIN_SOFTCLIP:' "$STAT_FILE" \
+        | awk '{print $3}' \
+        || { echo "!! Warning: no Auto MIN_SOFTCLIP found, defaulting to $MIN_SOFTCLIP" >&2; echo "$MIN_SOFTCLIP"; })
+
+      if [[ -z "$AUTO_MIN" ]]; then
+        echo "!! Failed to parse Auto MIN_SOFTCLIP from stats" >&2
+        exit 1
+      fi
+
+      # if the user wanted auto, override MIN_SOFTCLIP; otherwise keep theirs
+      if [[ "$ORIG_MIN" == "auto" ]]; then
+        MIN_SOFTCLIP=$AUTO_MIN
+        echo "[$(date)] Auto-set MIN_SOFTCLIP=$MIN_SOFTCLIP"
+      else
+        echo "[$(date)] Using user-supplied MIN_SOFTCLIP=$ORIG_MIN"
+        MIN_SOFTCLIP=$ORIG_MIN
+      fi
+
+      echo "[$(date)] Soft-clip stats phase ends (min=$MIN_SOFTCLIP)"
 
       # ─── Build IGV BAM of soft-clipped reads ─────────────────
       SC_DIR="$SAMPLE_DIR/chimera/softclipped_reads"
@@ -621,7 +998,7 @@ for fp in "$READS_DIR"/*; do
         "$PYTHON_EXE" scripts/parallel_softclip_filter.py \
           -i "$BAM" \
           -o "$SC_DIR" \
-          -m auto \
+          -m "$MIN_SOFTCLIP" \
           -t "$THREADS" \
           --mode igv
 
@@ -639,7 +1016,8 @@ for fp in "$READS_DIR"/*; do
       # ─── Only perform soft-clip filtering/trimming if the flag is enabled ────
       if [[ $FILTER_SOFTCLIP == true ]]; then
         echo "[$(date)] filter_softclipped_reads = $FILTER_SOFTCLIP"
-        echo "[$(date)] softclip_filter_mode     = $SOFTCLIP_MODE (automatic quality-based thresholds)"
+        echo "[$(date)] min_softclip_bases       = $MIN_SOFTCLIP"
+        echo "[$(date)] softclip_filter_mode     = $SOFTCLIP_MODE"
 
         # check if we already produced a fixmate’d BAM
         CS_BAM="$SAMPLE_DIR/${sample}.fixmate.bam"
@@ -650,9 +1028,17 @@ for fp in "$READS_DIR"/*; do
           # ─── Perform the chosen soft-clip operation ────────────────────────
           if [[ "$SOFTCLIP_MODE" == "full" || "$SOFTCLIP_MODE" == "trim" ]]; then
             if [[ "$SOFTCLIP_MODE" == "full" ]]; then
-              echo "[$(date)] Removing reads with low-quality artifactual soft-clips…"
+              if [[ "$ORIG_MIN" == "auto" ]]; then
+                echo "[$(date)] Removing entire reads with ≥${MIN_SOFTCLIP} (auto threshold) soft-clips…"
+              else
+                echo "[$(date)] Removing entire reads with ≥${MIN_SOFTCLIP} soft-clips…"
+              fi
             else
-              echo "[$(date)] Trimming low-quality artifactual soft-clipped ends…"
+              if [[ "$ORIG_MIN" == "auto" ]]; then
+                echo "[$(date)] Trimming soft-clipped ends when total clip ≥${MIN_SOFTCLIP} (auto threshold)…"
+              else
+                echo "[$(date)] Trimming soft-clipped ends when total clip ≥${MIN_SOFTCLIP}…"
+              fi
             fi
 
             PROCESSED_BAM="$SAMPLE_DIR/${sample}.filtered.softclip.bam"
@@ -664,7 +1050,7 @@ for fp in "$READS_DIR"/*; do
             "$PYTHON_EXE" scripts/parallel_softclip_filter.py \
               -i "$BAM" \
               -o "$SC_DIR" \
-              -m auto \
+              -m "$MIN_SOFTCLIP" \
               -t "$THREADS" \
               --mode "$SOFTCLIP_MODE"
 
@@ -702,302 +1088,131 @@ for fp in "$READS_DIR"/*; do
       fi  # end FILTER_SOFTCLIP guard
 
 
-      # ─── Coverage check + intelligent subsampling ────────────────────────────────
-      # Two-tier strategy:
-      # - Conservative by default: gentle reduction, assembly-safe, fast
-      # - Aggressive on demand: per-base precision, slower but preserves low-coverage regions
+      # ─── Coverage check + optional capping  ──────────────────────────────────────
       subbam="${SAMPLE_DIR}/${sample}.depthcapped.bam"
-      SUBSAMPLING_OCCURRED=false
-
+      RUN_FIXMATE=false
       if [[ ! -f "${subbam}" ]]; then
         # Always compute and display mean coverage for reporting
         mean_cov=$(samtools depth -a "${BAM}" \
                    | awk '{sum+=$3; cnt++} END {print (cnt? sum/cnt : 0)}')
         printf "[%s] Mean coverage: %.1f×\n" "$(date)" "${mean_cov}"
 
-        # Define conservative defaults optimized for assembly
-        CONSERVATIVE_MAX=1000     # Only subsample if coverage is extreme
-        CONSERVATIVE_TARGET=500   # Gentle reduction, still assembly-friendly
+        # Check if auto_subsample is enabled
+        if [[ "$AUTO_SUBSAMPLE" == "true" && $(echo "$mean_cov > $MAX_COV" | bc -l) -eq 1 ]]; then
 
-        # Use user values if provided, otherwise use conservative defaults
-        EFFECTIVE_MAX_COV=${MAX_COV:-$CONSERVATIVE_MAX}
-        EFFECTIVE_TARGET_COV=${TARGET_COV:-$CONSERVATIVE_TARGET}
+          echo "[$(date)] auto_subsample=true: Coverage ≥ ${MAX_COV}×, downsampling to ${TARGET_COV}…"
 
-        # Determine if subsampling is needed
-        if [[ "$AUTO_SUBSAMPLE" == "true" && $(echo "$mean_cov > $EFFECTIVE_MAX_COV" | bc -l) -eq 1 ]]; then
-
-          # Check if user specified custom values (triggers per-base mode)
-          if [[ "$USER_SPECIFIED_COVERAGE" == "true" ]]; then
-            echo "[$(date)] 🎯 User-specified thresholds detected: MAX=${EFFECTIVE_MAX_COV}×, TARGET=${EFFECTIVE_TARGET_COV}×"
-            echo "[$(date)] 🔬 Using assembly-optimized window-based subsampling (preserves assembly continuity)"
-
-            # ═══ AGGRESSIVE MODE: Per-base subsampling ═══
-            set +u
-            conda activate ssuitslsu-mapping
-            set -u
-            PYTHON_EXE="$CONDA_PREFIX/bin/python"
-            export BAM
-            export subbam
-            export EFFECTIVE_TARGET_COV
-
-            "${PYTHON_EXE}" << 'PYCODE'
+          PYTHON_EXE="$CONDA_PREFIX/bin/python"
+          "${PYTHON_EXE}" <<PYCODE
 import pysam, numpy as np, random
-import sys
-import os
-from collections import defaultdict
 
-print("🔬 Assembly-optimized window-based subsampling activated", file=sys.stderr)
-print("⚠️  This ensures continuous coverage for optimal assembly", file=sys.stderr)
+IN_BAM  = "${BAM}"
+OUT_BAM = "${subbam}"
+TARGET  = ${TARGET_COV}
 
-# Get parameters from environment
-IN_BAM = os.environ['BAM']
-OUT_BAM = os.environ['subbam']
-TARGET = float(os.environ['EFFECTIVE_TARGET_COV'])
-
-# Assembly-optimized parameters for short reads
-WINDOW_SIZE = 25          # 25bp windows for fine-grained control with short reads
-MIN_COVERAGE = max(5, TARGET * 0.2)   # Minimum 5× or 20% of target
-OVERLAP_BONUS = 2.0       # Higher bonus for reads spanning multiple windows
-
-# Set random seed for reproducibility
-random.seed(42)
-
-print(f"🎯 Target coverage: {TARGET}×, Min coverage: {MIN_COVERAGE}×, Window size: {WINDOW_SIZE}bp", file=sys.stderr)
-
-reads_to_keep = set()
-total_reads = 0
-
+# 1) Build a per‐contig prefix‐sum of keep‐probs
+keep_cumsum = {}
 with pysam.AlignmentFile(IN_BAM, "rb") as bam:
-    total_contigs = len(bam.references)
-    print(f"📊 Processing {total_contigs} reference sequences...", file=sys.stderr)
+    for rname, length in zip(bam.references, bam.lengths):
+        # 1a) get raw depth arrays (these come back as array.array)
+        covA, covC, covG, covT = bam.count_coverage(rname)
+        # 1b) convert to NumPy arrays so we can call vectorized ops
+        covA = np.array(covA, dtype=float)
+        covC = np.array(covC, dtype=float)
+        covG = np.array(covG, dtype=float)
+        covT = np.array(covT, dtype=float)
+        # 1c) sum to get total per-base depth
+        depth = covA + covC + covG + covT
+        # 1d) avoid zero‐division: treat depth=0 as p=1
+        depth[depth == 0] = TARGET
+        # 1e) per-base keep‐probabilities: min(1,TARGET/depth)
+        p = np.minimum(1.0, TARGET / depth)
+        # 1f) build prefix‐sum so sum(p[s:e]) = ps[e] – ps[s]
+        ps = np.empty(len(p) + 1, dtype=float)
+        ps[0] = 0.0
+        ps[1:] = p.cumsum()
+        keep_cumsum[rname] = ps
 
-    for contig_idx, (rname, length) in enumerate(zip(bam.references, bam.lengths)):
-        print(f"   🧬 Analyzing contig {contig_idx+1}/{total_contigs}: {rname} ({length:,}bp)", file=sys.stderr)
-
-        # Step 1: Get all reads for this contig
-        contig_reads = []
-        for read in bam.fetch(rname):
-            if not read.is_unmapped and read.reference_start < read.reference_end:
-                contig_reads.append(read)
-
-        total_reads += len(contig_reads)
-        print(f"      📖 Found {len(contig_reads):,} mapped reads", file=sys.stderr)
-
-        if not contig_reads:
-            continue
-
-        # Step 2: Calculate current coverage per window
-        num_windows = (length + WINDOW_SIZE - 1) // WINDOW_SIZE
-        window_coverage = np.zeros(num_windows)
-        window_reads = defaultdict(list)
-
-        for read in contig_reads:
-            start_win = read.reference_start // WINDOW_SIZE
-            end_win = min((read.reference_end - 1) // WINDOW_SIZE, num_windows - 1)
-
-            # Count read contribution to each window it spans
-            for win_idx in range(start_win, end_win + 1):
-                window_coverage[win_idx] += 1
-                window_reads[win_idx].append(read)
-
-        initial_mean_cov = window_coverage.mean()
-        print(f"      📈 Initial mean coverage: {initial_mean_cov:.1f}×", file=sys.stderr)
-
-        # Step 3: Window-based intelligent subsampling
-        selected_reads_this_contig = set()
-
-        # Phase 1: Ensure minimum coverage in all windows
-        for win_idx in range(num_windows):
-            win_reads = window_reads[win_idx]
-            current_cov = window_coverage[win_idx]
-
-            if current_cov <= MIN_COVERAGE:
-                # Keep all reads in low-coverage windows
-                for read in win_reads:
-                    selected_reads_this_contig.add(read.query_name)
-            else:
-                # Subsample high-coverage windows but maintain minimum
-                target_reads = max(int(MIN_COVERAGE), int(current_cov * TARGET / initial_mean_cov))
-                target_reads = min(target_reads, len(win_reads))
-
-                # Prioritize reads that span multiple windows (better for assembly)
-                read_scores = []
-                for read in win_reads:
-                    span_windows = ((read.reference_end - 1) // WINDOW_SIZE) - (read.reference_start // WINDOW_SIZE) + 1
-                    score = span_windows * OVERLAP_BONUS + random.random()  # Add randomness for tie-breaking
-                    read_scores.append((score, read))
-
-                # Select top-scoring reads
-                read_scores.sort(reverse=True)
-                for i in range(target_reads):
-                    selected_reads_this_contig.add(read_scores[i][1].query_name)
-
-        # Phase 2: Fill remaining quota with best spanning reads
-        current_selection_size = len(selected_reads_this_contig)
-        total_target = int(len(contig_reads) * TARGET / initial_mean_cov)
-
-        if current_selection_size < total_target:
-            remaining_quota = total_target - current_selection_size
-
-            # Get unselected reads, prioritize long spans
-            unselected_reads = [r for r in contig_reads if r.query_name not in selected_reads_this_contig]
-            span_scores = []
-
-            for read in unselected_reads:
-                span_length = read.reference_end - read.reference_start
-                span_windows = ((read.reference_end - 1) // WINDOW_SIZE) - (read.reference_start // WINDOW_SIZE) + 1
-                score = span_length * span_windows + random.random()
-                span_scores.append((score, read))
-
-            span_scores.sort(reverse=True)
-            for i in range(min(remaining_quota, len(span_scores))):
-                selected_reads_this_contig.add(span_scores[i][1].query_name)
-
-        reads_to_keep.update(selected_reads_this_contig)
-
-        # Calculate final coverage for this contig
-        final_coverage = np.zeros(num_windows)
-        for read in contig_reads:
-            if read.query_name in selected_reads_this_contig:
-                start_win = read.reference_start // WINDOW_SIZE
-                end_win = min((read.reference_end - 1) // WINDOW_SIZE, num_windows - 1)
-                for win_idx in range(start_win, end_win + 1):
-                    final_coverage[win_idx] += 1
-
-        final_mean = final_coverage.mean()
-        final_min = final_coverage.min()
-        final_max = final_coverage.max()
-        kept_pct = (len(selected_reads_this_contig) / len(contig_reads)) * 100
-
-        print(f"      ✅ Selected {len(selected_reads_this_contig):,}/{len(contig_reads):,} reads ({kept_pct:.1f}%)", file=sys.stderr)
-        print(f"      📊 Final coverage: mean={final_mean:.1f}×, min={final_min:.0f}×, max={final_max:.0f}×", file=sys.stderr)
-
-# Step 4: Write selected reads to output
-print(f"🔄 Writing selected reads to output...", file=sys.stderr)
-reads_processed = 0
-reads_kept = 0
-
+# 2) One‐pass through reads, O(1) per read
 with pysam.AlignmentFile(IN_BAM, "rb") as bam, \
      pysam.AlignmentFile(OUT_BAM, "wb", template=bam) as out:
-
     for read in bam.fetch():
-        reads_processed += 1
-
-        if reads_processed % 100000 == 0:
-            kept_pct = (reads_kept/reads_processed)*100 if reads_processed > 0 else 0
-            print(f"   📝 Written {reads_processed:,} reads, kept {kept_pct:.1f}%", file=sys.stderr)
-
-        if read.is_unmapped or read.query_name in reads_to_keep:
+        if read.is_unmapped:
+            continue
+        s, e = read.reference_start, read.reference_end
+        if e <= s:
             out.write(read)
-            reads_kept += 1
+            continue
 
-reduction_pct = (1.0 - reads_kept/reads_processed) * 100 if reads_processed > 0 else 0
-
-print(f"✅ Assembly-optimized subsampling complete:", file=sys.stderr)
-print(f"   📊 Processed: {reads_processed:,} reads", file=sys.stderr)
-print(f"   ✂️  Kept: {reads_kept:,} reads ({100-reduction_pct:.1f}%)", file=sys.stderr)
-print(f"   🗑️  Removed: {reads_processed-reads_kept:,} reads ({reduction_pct:.1f}%)", file=sys.stderr)
-print(f"   🎯 Assembly continuity preserved with minimum {MIN_COVERAGE}× coverage", file=sys.stderr)
+        ps = keep_cumsum[read.reference_name]
+        # sum(p[s…e-1]) = ps[e] – ps[s]
+        p_read = (ps[e] - ps[s]) / (e - s)
+        if random.random() < p_read:
+            out.write(read)
 PYCODE
 
-            # Index the subsampled BAM file
-            echo "[$(date)] 🔧 Indexing subsampled BAM file..."
-            samtools index "${subbam}"
+          RUN_FIXMATE=true
+        else
+          echo "[$(date)] auto_subsample=false: Skipping coverage-based downsampling (copying original)."
+          cp "${BAM}" "${subbam}"
+          RUN_FIXMATE=false
+        fi
 
-            # Verify final coverage achieved
-            echo "[$(date)] 🔍 Verifying final coverage..."
-            final_cov=$(samtools depth -a "${subbam}" \
-                       | awk '{sum+=$3; cnt++} END {print (cnt? sum/cnt : 0)}')
-            printf "[%s] ✅ Final coverage: %.1f× (target: %s×)\n" "$(date)" "${final_cov}" "${EFFECTIVE_TARGET_COV}"
+        if [[ "$RUN_FIXMATE" == true ]]; then
 
-            SUBSAMPLING_OCCURRED=true
-            echo "[$(date)] ✅ Aggressive per-base subsampling completed: ${mean_cov}× → ${EFFECTIVE_TARGET_COV}×"
+          FIXMATE_NS="${SAMPLE_DIR}/${sample}.depthcapped.namesorted.bam"
+          FIXMATE_NS_OUT="${SAMPLE_DIR}/${sample}.depthcapped.fixmate.namesorted.bam"
+          FIXMATE_CS="${SAMPLE_DIR}/${sample}.depthcapped.fixmate.coordsorted.bam"
 
-          else
-            echo "[$(date)] 🛡️  Conservative mode: gentle subsampling for assembly safety"
-            echo "[$(date)] 📉 Reducing ${mean_cov}× → ${EFFECTIVE_TARGET_COV}× (preserving assembly quality)"
-
-            # ═══ CONSERVATIVE MODE: Simple but safe ═══
-            FRAC=$(awk -v t="$EFFECTIVE_TARGET_COV" -v c="$mean_cov" \
-              'BEGIN { frac = t/c; print (frac > 1.0 ? 1.0 : frac) }')
-
-            echo "[$(date)] 📊 Gentle subsampling fraction: $FRAC"
-
-            # Fast uniform subsampling with proper random seed
-            samtools view -h -@ "$THREADS" -s "1234${FRAC}" "$BAM" \
-              | samtools sort -@ "$THREADS" -o "$subbam" -T "$SAMPLE_DIR/subsample_tmp"
-
-            SUBSAMPLING_OCCURRED=true
-            echo "[$(date)] ✅ Conservative subsampling completed"
+          # 1) Name-sort (if not already done)
+          if [[ ! -f "$FIXMATE_NS" ]]; then
+            echo "[$(date)] Name-sorting depthcapped BAM…"
+            samtools sort -n -@ "$THREADS" -o "$FIXMATE_NS" "$subbam"
           fi
 
+          # 2) fixmate (if not already done)
+          if [[ ! -f "$FIXMATE_NS_OUT" ]]; then
+            echo "[$(date)] Applying fixmate…"
+            samtools fixmate -m -@ "$THREADS" "$FIXMATE_NS" "$FIXMATE_NS_OUT"
+          fi
+
+          # 3) coord-sort + filter unmapped + index (if not already done)
+          if [[ ! -f "$FIXMATE_CS" ]]; then
+            echo "[$(date)] Coordinate-sorting and filtering…"
+            samtools view -bh -@ "$THREADS" -F 4 "$FIXMATE_NS_OUT" \
+              | samtools sort -@ "$THREADS" -o "$FIXMATE_CS"
+            samtools index "$FIXMATE_CS"
+          fi
+
+          BAM="$FIXMATE_CS"
         else
-          echo "[$(date)] 🎯 Coverage acceptable (${mean_cov}× ≤ ${EFFECTIVE_MAX_COV}×), no subsampling needed"
-          cp "${BAM}" "${subbam}"
-          SUBSAMPLING_OCCURRED=false
+          # no fixmate at all if RUN_FIXMATE=false
+          BAM="$subbam"
         fi
 
       else
         echo "[$(date)] Depth-capped BAM exists; skipping coverage analysis."
-        # Check if this was a subsampled file (rough heuristic)
-        original_size=$(stat -f%z "$BAM" 2>/dev/null || stat -c%s "$BAM" 2>/dev/null || echo "0")
-        subsampled_size=$(stat -f%z "$subbam" 2>/dev/null || stat -c%s "$subbam" 2>/dev/null || echo "0")
+        if [[ "$RUN_FIXMATE" == true ]]; then
+          FIXMATE_NS="${SAMPLE_DIR}/${sample}.depthcapped.namesorted.bam"
+          FIXMATE_NS_OUT="${SAMPLE_DIR}/${sample}.depthcapped.fixmate.namesorted.bam"
+          FIXMATE_CS="${SAMPLE_DIR}/${sample}.depthcapped.fixmate.coordsorted.bam"
 
-        if [[ "$subsampled_size" -lt "$original_size" ]]; then
-          SUBSAMPLING_OCCURRED=true
-          echo "[$(date)] Existing file appears to be subsampled (smaller than original)"
+          if [[ ! -f "$FIXMATE_CS" ]]; then
+              echo "[$(date)] Depthcapped exists but missing fixmate steps; running now."
+              samtools sort -n -@ "$THREADS" -o "$FIXMATE_NS" "$subbam"
+              samtools fixmate -m -@ "$THREADS" "$FIXMATE_NS" "$FIXMATE_NS_OUT"
+              samtools sort -@ "$THREADS" -o "$FIXMATE_CS" "$FIXMATE_NS_OUT"
+              samtools index "$FIXMATE_CS"
+              BAM="$FIXMATE_CS"
+          else
+              echo "[$(date)] Fixmate already done on depthcapped; skipping."
+          fi
+
         else
-          SUBSAMPLING_OCCURRED=false
+          echo "[$(date)] No fixmate needed, using existing depth-capped BAM."
+          BAM="$subbam"
         fi
       fi
-
-      # ─── Conditional fixmate based on what operations occurred ────────────────────
-      NEEDS_FIXMATE=false
-
-      # Check if subsampling occurred
-      if [[ "$SUBSAMPLING_OCCURRED" == "true" ]]; then
-        echo "[$(date)] 🔧 Fixmate needed: subsampling occurred"
-        NEEDS_FIXMATE=true
-      fi
-
-      # Apply fixmate only if needed
-      if [[ "$NEEDS_FIXMATE" == "true" ]]; then
-        echo "[$(date)] 🔧 Running fixmate to correct mate-pair flags after subsampling..."
-
-        FIXMATE_NS="${SAMPLE_DIR}/${sample}.depthcapped.namesorted.bam"
-        FIXMATE_NS_OUT="${SAMPLE_DIR}/${sample}.depthcapped.fixmate.namesorted.bam"
-        FIXMATE_CS="${SAMPLE_DIR}/${sample}.depthcapped.fixmate.coordsorted.bam"
-
-        if [[ ! -f "$FIXMATE_CS" ]]; then
-          # 1) Name-sort
-          echo "[$(date)] Name-sorting for fixmate..."
-          samtools sort -n -@ "$THREADS" -o "$FIXMATE_NS" "$subbam"
-
-          # 2) fixmate
-          echo "[$(date)] Applying fixmate corrections..."
-          samtools fixmate -m -@ "$THREADS" "$FIXMATE_NS" "$FIXMATE_NS_OUT"
-
-          # 3) coord-sort + filter unmapped + index
-          echo "[$(date)] Coordinate-sorting and indexing..."
-          samtools view -bh -@ "$THREADS" -F 4 "$FIXMATE_NS_OUT" \
-            | samtools sort -@ "$THREADS" -o "$FIXMATE_CS"
-          samtools index "$FIXMATE_CS"
-
-          # Clean up intermediate files
-          rm -f "$FIXMATE_NS" "$FIXMATE_NS_OUT"
-
-          BAM="$FIXMATE_CS"
-          echo "[$(date)] ✅ Fixmate completed, using corrected BAM"
-        else
-          echo "[$(date)] Fixmate files already exist, using existing corrected BAM"
-          BAM="$FIXMATE_CS"
-        fi
-      else
-        echo "[$(date)] 🎯 No fixmate needed, using BAM as-is"
-        BAM="$subbam"
-      fi
-
-
 
       # ─── Extract mapped reads with conditional filtering ────────────────────────
       P1="$SAMPLE_DIR/${sample}.mapped_1.fastq.gz"
@@ -1090,8 +1305,8 @@ PYCODE
         fi
 
         # sanity check: ensure mate-pair counts match
-        p1=$(zgrep -c '^@' "$P1" 2>/dev/null || echo 0)
-        p2=$(zgrep -c '^@' "$P2" 2>/dev/null || echo 0)
+        p1=$(zgrep -c '^@' "$P1")
+        p2=$(zgrep -c '^@' "$P2")
         if [[ "$p1" -ne "$p2" ]]; then
           echo "[ERROR] mate-pair counts mismatch: R1=$p1 vs R2=$p2" >&2
           exit 1
@@ -1164,9 +1379,7 @@ PYCODE
               -o "$SP_DIR"
           )
 
-          set +e
           "${cmd[@]}" 2>&1 | tee "$SP_DIR/spades.log"
-          set -e
 
           # Check for contigs; if none, retry with relaxed parameters
           CONTIG="$SP_DIR/contigs.fasta"
@@ -1183,7 +1396,6 @@ PYCODE
             "$THREADS" "$MEM" "$SP_DIR" "$P1" "$P2" >&2
             rm -rf "$SP_DIR"
             mkdir -p "$SP_DIR"
-            set +e
             spades.py \
               -t "$THREADS" \
               -m "$MEM" \
@@ -1193,8 +1405,6 @@ PYCODE
               -1 "$P1" \
               -2 "$P2" \
             2>&1 | tee "$SP_DIR/spades.retry.log"
-            set -e
-
           fi
 
           # If still no contigs, skip to the next FASTQ pair
@@ -1247,9 +1457,7 @@ PYCODE
           [[ -f "$U0" ]] && cmd+=( -r "$U0" )
 
           # run and capture the log
-          set +e
           "${cmd[@]}" 2>&1 | tee "$MH_DIR/megahit.log"
-          set -e
 
           # Check for contigs; if none, skip to the next FASTQ pair
           CONTIGS="$MH_DIR/final.contigs.fa"
@@ -1309,6 +1517,14 @@ PYCODE
           set -u
           mean_45S_cov=$(samtools depth -a "$BAM" \
                            | awk '{sum+=$3; cnt++} END{ if(cnt) printf("%.1f", sum/cnt); else print "0.0" }')
+
+          if [[ "$mean_45S_cov" == "0.0" ]]; then
+            echo "[$(date)] No mapped reads (mean_45S_cov=0.0); skipping this sample."
+            # restore file descriptors before jumping out
+            exec 1>&3 2>&4
+            exec 3>&- 4>&-
+            continue 2
+          fi
 
           {
             echo "CONTIGS-${STATS_MINLEN}BP:    $NUM_SEQS"
@@ -1398,20 +1614,23 @@ PYCODE
                --cpu "$THREADS" \
             && touch "$RECHECK_DONE"
 
-          # append eventuali hit nuovi nei file small.*.fasta
+          # append new hit nuovi in file small.*.fasta
           for region in full ITS1 ITS2 SSU LSU 5_8S; do
             recheck_fa="${ITSX_DIR}/${sample}.small.recheck.${region}.fasta"
             main_fa="${SMALL_PREFIX}.${region}.fasta"
+
             if [[ -s "$recheck_fa" ]]; then
               echo "[`date`] Adding recheck ${region} → ${main_fa}"
               cat "$recheck_fa" >> "$main_fa"
+            else
+              # no new hits for this region: delete the empty file
+              echo "[`date`] No recheck hits for ${region}; deleting ${recheck_fa}"
+              rm -f "$recheck_fa"
             fi
           done
         fi
 
-
-
-        # 2) run ITSx on the large contigs (nhmmer)
+        # 2) run ITSx on the large contigs (nhmmer) - no region mapping
         if [[ -s "$LARGE_FASTA" && ! -f "$LARGE_DONE" ]]; then
           echo "[`date`] Running ITSx (nhmmer) on large contigs for $sample"
           ITSx -i "$LARGE_FASTA" \
@@ -1452,30 +1671,12 @@ PYCODE
         : > "$CONTIGS_FASTA"
         : > "$SAMPLE_SEQ_FASTA"
 
-        # 3a) Collect ITSx outputs and count by region type
-        ITS_COUNT=0
-        SSU_COUNT=0
-        LSU_COUNT=0
-        OTHER_COUNT=0
-
+        # 3a) Collect ITSx outputs
         for size in small large_nhmmer; do
           for region in full ITS1 ITS2 SSU LSU 5_8S; do
             src="$ITSX_DIR/${sample}.${size}.${region}.fasta"
             if [[ -s "$src" ]]; then
-              seq_count=$(grep -c "^>" "$src" 2>/dev/null || echo "0")
-              printf "[%s] Adding ITSx %-4s (%s): %d sequences → %s\n" "$(date)" "$region" "$size" "$seq_count" "$src"
-
-              # Count by region type
-              if [[ "$region" =~ ^(full|ITS1|ITS2|5_8S)$ ]]; then
-                ITS_COUNT=$((ITS_COUNT + seq_count))
-              elif [[ "$region" == "SSU" ]]; then
-                SSU_COUNT=$((SSU_COUNT + seq_count))
-              elif [[ "$region" == "LSU" ]]; then
-                LSU_COUNT=$((LSU_COUNT + seq_count))
-              else
-                OTHER_COUNT=$((OTHER_COUNT + seq_count))
-              fi
-
+              printf "[%s] Adding ITSx %-4s (%s) → %s\n" "$(date)" "$region" "$size" "$src"
               awk -v smp="$sample" -v sz="$size" -v rgn="$region" '
                 /^>/ { sub(/^>/, ">" smp "_" sz "_" rgn "_"); print; next }
                 { print }
@@ -1484,67 +1685,28 @@ PYCODE
           done
         done
 
-        # Report what we found
-        echo "[$(date)] ITSx region summary: $ITS_COUNT ITS, $SSU_COUNT SSU, $LSU_COUNT LSU, $OTHER_COUNT other"
-        echo "[$(date)] DEBUG: Starting ITS concatenation section" >&2
-
-        # ─── 3a.5) ITS concatenation fallback (only ITS1+5.8S+ITS2) ────────────────
-        FULL_ITS_COUNT=0
-        SMALL_REGIONS_FOUND=0
-
-        # Count full ITS sequences
-        for full_file in "$ITSX_DIR"/${sample}.*.full.fasta; do
-          if [[ -s "$full_file" ]]; then
-            file_count=$(grep -c "^>" "$full_file" 2>/dev/null || echo "0")
-            FULL_ITS_COUNT=$((FULL_ITS_COUNT + file_count))
-          fi
-        done
-        echo "[$(date)] DEBUG: Found $FULL_ITS_COUNT full ITS sequences" >&2
-
+        # 3a.5) ITS Concatenation Fallback: if no full ITS found, try to concatenate ITS1 + 5.8S + ITS2
+        FULL_ITS_COUNT=$(find "$ITSX_DIR" -name "${sample}.*.full.fasta" -exec cat {} \; 2>/dev/null | grep -c "^>" 2>/dev/null || echo "0")
         CONCATENATED_ITS_FASTA="$PHYLO_DIR/${sample}_concatenated_ITS.fasta"
 
-        # Count small ITS regions for potential concatenation
-        for region in ITS1 5_8S ITS2; do
-          if [[ -s "$ITSX_DIR/${sample}.small.${region}.fasta" ]]; then
-            SMALL_REGIONS_FOUND=$((SMALL_REGIONS_FOUND + 1))
-          fi
-        done
-        echo "[$(date)] DEBUG: Found $SMALL_REGIONS_FOUND small regions" >&2
-
-        # Apply concatenation logic
-        if [[ "$FULL_ITS_COUNT" -eq 0 && "$SMALL_REGIONS_FOUND" -ge 2 ]]; then
-          echo "[$(date)] No full ITS sequences; attempting concatenation fallback ($SMALL_REGIONS_FOUND small regions found)"
-
+        if [[ "$FULL_ITS_COUNT" -eq 0 ]]; then
+          echo "[$(date)] No full ITS sequences found, attempting ITS concatenation fallback..."
           set +u
-          conda activate ssuitslsu-utils
+          conda activate ssuitslsu-utils  # Environment with BioPython
           set -u
 
-          set +e
-          python3 "$(dirname "$0")/its_concatenation_fallback.py" \
-            "$ITSX_DIR" "$sample" "$CONCATENATED_ITS_FASTA"
-          PY_EXIT=$?
-          set -e
+          python3 "$(dirname "$0")/its_concatenation_fallback.py" "$ITSX_DIR" "$sample" "$CONCATENATED_ITS_FASTA"
 
-          if [[ $PY_EXIT -eq 0 && -s "$CONCATENATED_ITS_FASTA" ]]; then
-            echo "[$(date)] Successfully concatenated ITS sequences, adding to collection"
+          # Add concatenated ITS sequences to the ITSx FASTA if any were created
+          if [[ -s "$CONCATENATED_ITS_FASTA" ]]; then
+            echo "[$(date)] Adding concatenated ITS sequences to ITSx collection"
             cat "$CONCATENATED_ITS_FASTA" >> "$ITSX_FASTA"
           else
-            echo "[$(date)] ITS concatenation failed or produced no sequences"
-          fi
-        elif [[ "$FULL_ITS_COUNT" -eq 0 && "$SMALL_REGIONS_FOUND" -lt 2 ]]; then
-          if [[ "$SSU_COUNT" -gt 0 || "$LSU_COUNT" -gt 0 ]]; then
-            echo "[$(date)] No ITS sequences, but found $SSU_COUNT SSU and $LSU_COUNT LSU sequences - proceeding with alignment"
-          else
-            echo "[$(date)] No ITS, SSU, or LSU sequences found - alignment will use contigs only"
+            echo "[$(date)] No ITS regions could be concatenated (need ≥2 regions per sequence)"
           fi
         else
-          echo "[$(date)] Found $FULL_ITS_COUNT full ITS sequences - skipping concatenation"
+          echo "[$(date)] Found $FULL_ITS_COUNT full ITS sequences, skipping concatenation fallback"
         fi
-        echo "[$(date)] DEBUG: Finished ITS concatenation logic" >&2
-
-        echo "[$(date)] Proceeding with sequence selection and alignment"
-        echo "[$(date)] DEBUG: Starting contig selection" >&2
-
 
         # 3b) Extract contigs ≥300 bp & cov>40 (SPAdes cov_ or MEGAHIT multi), plus always include ITSx-hit contigs
 
@@ -1553,22 +1715,18 @@ PYCODE
         SMALL_POS="$ITSX_DIR/${sample}.small.positions.txt"
         if [[ -s "$LARGE_POS" ]]; then
           POS_FILE="$LARGE_POS"
-          echo "[$(date)] DEBUG: Using large positions file" >&2
         elif [[ -s "$SMALL_POS" ]]; then
           POS_FILE="$SMALL_POS"
-          echo "[$(date)] DEBUG: Using small positions file" >&2
         else
           POS_FILE=""
-          echo "[$(date)] DEBUG: No position files found" >&2
         fi
         combined_pos=$(mktemp)
         if [[ -z "$POS_FILE" ]]; then
           printf "[%s] No ITSx hits for %s; including *all* contigs\n" "$(date)" "$sample"
           # fallback: just copy every contig through
           cp "$CONTIG" "$CONTIGS_FASTA"
-          echo "[$(date)] DEBUG: Copied all contigs" >&2
         else
-          echo "[$(date)] DEBUG: Processing ITSx hits and filtering contigs" >&2
+
           printf "[%s] Selecting contigs for alignment (ITSx hits + length/coverage filter) from %s → %s\n" \
             "$(date)" "$CONTIG" "$CONTIGS_FASTA"
 
@@ -1642,26 +1800,6 @@ PYCODE
 
         # 4) Merge ITSx + contigs into the final sample FASTA
         cat "$CONTIGS_FASTA" "$ITSX_FASTA" > "$SAMPLE_SEQ_FASTA"
-
-        # Report sequence counts for debugging
-        ITSX_COUNT=$(grep -c "^>" "$ITSX_FASTA" 2>/dev/null || echo "0")
-        CONTIGS_COUNT=$(grep -c "^>" "$CONTIGS_FASTA" 2>/dev/null || echo "0")
-        TOTAL_COUNT=$(grep -c "^>" "$SAMPLE_SEQ_FASTA" 2>/dev/null || echo "0")
-
-        echo "[$(date)] Sequence summary for $sample:"
-        echo "[$(date)]   - ITSx sequences: $ITSX_COUNT ($ITS_COUNT ITS, $SSU_COUNT SSU, $LSU_COUNT LSU)"
-        echo "[$(date)]   - Contigs: $CONTIGS_COUNT"
-        echo "[$(date)]   - Total sequences: $TOTAL_COUNT"
-
-        # Check if we have any sequences at all
-        if [[ "$TOTAL_COUNT" -eq 0 ]]; then
-          echo "[$(date)] ⚠️  No sequences found for $sample - creating minimal placeholder sequence"
-          # Create a minimal sequence so alignment can still proceed
-          echo ">${sample}_no_sequences_found" > "$SAMPLE_SEQ_FASTA"
-          echo "NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN" >> "$SAMPLE_SEQ_FASTA"
-        else
-          echo "[$(date)] ✅ Proceeding with alignment using available sequences"
-        fi
       fi
 
       # 5a) Build reference at the same taxonomic level used for mapping
@@ -1750,18 +1888,10 @@ PYCODE
       fi
 
 
-      REF_COUNT=$(grep -c '^>' "$REF_PHYLO_FASTA" 2>/dev/null || echo "0")
-      SAMPLE_COUNT=$(grep -c '^>' "$SAMPLE_SEQ_FASTA" 2>/dev/null || echo "0")
-      TOTAL_PHYLO_COUNT=$(grep -c '^>' "$PHYLO_FASTA" 2>/dev/null || echo "0")
-
-      printf "[%s] Combined phylo FASTA: %s (%d refs + %d sample seqs = %d total)\n\n" \
-        "$(date)" "$PHYLO_FASTA" "$REF_COUNT" "$SAMPLE_COUNT" "$TOTAL_PHYLO_COUNT"
-
-      # Ensure we have enough sequences for meaningful alignment
-      if [[ "$TOTAL_PHYLO_COUNT" -lt 2 ]]; then
-        echo "[$(date)] ⚠️  Only $TOTAL_PHYLO_COUNT sequences total - alignment may not be meaningful"
-        echo "[$(date)] Proceeding anyway to maintain pipeline consistency"
-      fi
+      printf "[%s] Combined phylo FASTA: %s (%d refs + %d sample seqs)\n\n" \
+        "$(date)" "$PHYLO_FASTA" \
+        "$(grep -c '^>' "$REF_PHYLO_FASTA")" \
+        "$(grep -c '^>' "$SAMPLE_SEQ_FASTA")"
 
       # 6a) MAFFT alignment: run if missing OR FASTA is newer than the .aln
       PHYLO_ALN="$PHYLO_DIR/${safe_phylo_tag}.aln"
