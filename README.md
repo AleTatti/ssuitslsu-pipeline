@@ -1,7 +1,7 @@
 # ssuitslsu-pipeline
 
 > ⚠️ **Warning:** This pipeline is under active development.  
-> If you’ve cloned it previously, please run `git pull origin main` (or re‐clone) to get the latest changes before use.
+> If you've cloned it previously, please run `git pull origin main` (or re‐clone) to get the latest changes before use.
 
 **SSU + ITS + LSU extraction**
 Extracts ribosomal small subunit (SSU), internal transcribed spacer (ITS), and large subunit (LSU) regions from fungal genome‐skimming data, assembles contigs, annotates ITS regions, builds per‐genus alignments and phylogenetic trees, and includes sliding‐window chimera detection.
@@ -25,20 +25,40 @@ Extracts ribosomal small subunit (SSU), internal transcribed spacer (ITS), and l
    cd ssuitslsu-pipeline
    ```
 
-2. **Create the Conda environments**
-   This pipeline uses separate environments to isolate dependencies:
-
+2. **Set up Conda environments**
+   
+   **Option A: Automated setup (Recommended)**
+   ```bash
+   ./scripts/setup_environments.sh
+   ```
+   
+   **Option B: Manual setup**
    ```bash
    conda env create -f envs/utils.yaml
-   conda env create -f envs/taxo.yaml
    conda env create -f envs/fastp.yaml
    conda env create -f envs/mapping.yaml
-   conda env create -f envs/spades.yaml
-   conda env create -f envs/megahit.yaml
    conda env create -f envs/itsx.yaml
+   conda env create -f envs/chimera.yaml
    conda env create -f envs/mafft.yaml
    conda env create -f envs/iqtree.yaml
-   conda env create -f envs/chimera.yaml
+   conda env create -f envs/spades.yaml
+   conda env create -f envs/megahit.yaml
+   conda env create -f envs/taxo.yaml
+   ```
+
+3. **Keep environments updated**
+   
+   In addition to updating the repository, make sure to regularly update the Conda environments to keep dependencies current. You can do this by re-running:
+   
+   ```bash
+   ./scripts/setup_environments.sh
+   ```
+   
+   Or update individual environments:
+   ```bash
+   conda env update -f envs/utils.yaml --prune
+   conda env update -f envs/mapping.yaml --prune
+   # ... etc for other environments
    ```
 
 ---
@@ -81,83 +101,57 @@ skip_phylogeny: true  # if true, skip IQ-TREE phylogenetic inference for faster 
 
 ## 🚀 Running the pipeline
 
-Once your configuration is set, run:
+1. **Prepare your configuration** (edit `config/pipeline.yaml`)
 
-```bash
-bash scripts/run_pipeline.sh
-```
+2. **Run the pipeline:**
+   ```bash
+   ./scripts/run_pipeline.sh
+   ```
 
-1. This will automatically:
-2. Download & filter the fungal SSU+ITS+LSU reference.
-3. Convert your taxonomy sheet (BOLD format) into CSV.
-4. Trim reads with fastp (or skip if already trimmed).
-5. Map reads to the best‐matching reference—compute soft‐clip stats/filter if enabled, downsample by coverage, and extract mapped reads.
-6. Assemble contigs (SPAdes or MEGAHIT) and report stats for contigs ≥ 1 kb.
-7. Extract SSU, ITS, and LSU regions with ITSx (choosing HMMER vs. NHMMER based on contig length).
-8. Build per‐genus 45S FASTA sets, perform alignment trimming, and infer ML trees (MAFFT + IQ-TREE).
-9. Detect chimeras using a sliding p-distance scan (Python helper).
-10. Record per‐sample timings and send all output to ssuitslsu_YYYYMMDD_HHMMSS.log.
+### Pipeline Steps
+
+The pipeline will automatically:
+
+1. **Environment Setup**: Activate required conda environments
+2. **Reference Download**: Download & filter the fungal SSU+ITS+LSU reference database
+3. **Taxonomy Conversion**: Convert your taxonomy sheet (BOLD format) into CSV
+4. **Quality Control**: Trim reads with fastp (or skip if already trimmed)
+5. **Read Mapping**: Map reads to best-matching reference with coverage-based downsampling
+6. **Assembly**: Assemble contigs using SPAdes or MEGAHIT
+7. **ITS Extraction**: Extract SSU, ITS, and LSU regions with ITSx
+8. **Phylogenetic Analysis**: Build per-genus alignments and ML trees (MAFFT + IQ-TREE)
+9. **Chimera Detection**: Detect chimeras using sliding p-distance analysis
+10. **Reporting**: Generate comprehensive reports and timings
+
+All output is logged to `ssuitslsu_YYYYMMDD_HHMMSS.log`
 
 ---
 
 
 ## 🔧 CLI / Usage Options
 
-Usage: `run_pipeline.sh [OPTIONS]`
+Usage: `./scripts/run_pipeline.sh [OPTIONS]`
 
-- `-n`, `--no-trim`  
-  Skip fastp trimming (use existing FASTQs)
-
-- `-m`, `--max-memory MB`  
-  Override memory (GB) for SPAdes/MEGAHIT
-
-- `-t`, `--threads N`  
-  Override number of threads for all steps
-
-- `--assembler [spades|megahit]`  
-  Choose assembler (“spades” or “megahit”)
-
-- `--mapq N`  
-  Override mapping-quality filter (samtools -q)
-
-- `--filter-softclip`  
-  Enable soft-clip filtering of BAM
-
-- `--min-softclip N`  
-  Override minimum soft-clip bases
-
-- `--softclip-mode MODE`  
-  Override soft-clip filter mode (`full` | `trim`)
-
-- `--auto-subsample [true|false]`  
-  Override auto_subsample behavior
-
-- `--max-cov N`  
-  Override `max_coverage` threshold
-
-- `--target-cov N`  
-  Override `target_coverage` threshold
-
-- `--reads-dir DIR`  
-  Specify directory containing raw read files
-
-- `--taxonomy-file FILE`  
-  Path to taxonomy file (Excel .xlsx or .csv)
-
-- `--taxonomy-sheet SHEET`  
-  Sheet name within taxonomy file
-
-- `--skip_phylogeny [true|false]`  
-  Override skip_phylogeny behavior
-
-- `--ref-fasta FILE`  
-  Reference FASTA for mapping/indexing
-
-- `--outdir DIR`  
-  Override output directory
-
-- `-h`, `--help`  
-  Show this help message and exit
+| Option | Description |
+|--------|-------------|
+| `-n`, `--no-trim` | Skip fastp trimming (use existing FASTQs) |
+| `-m`, `--max-memory MB` | Override memory (GB) for SPAdes/MEGAHIT |
+| `-t`, `--threads N` | Override number of threads for all steps |
+| `--assembler [spades\|megahit]` | Choose assembler ("spades" or "megahit") |
+| `--mapq N` | Override mapping-quality filter (samtools -q) |
+| `--filter-softclip` | Enable soft-clip filtering of BAM |
+| `--min-softclip N` | Override minimum soft-clip bases |
+| `--softclip-mode MODE` | Override soft-clip filter mode (`full` \| `trim`) |
+| `--auto-subsample [true\|false]` | Override auto_subsample behavior |
+| `--max-cov N` | Override `max_coverage` threshold |
+| `--target-cov N` | Override `target_coverage` threshold |
+| `--reads-dir DIR` | Specify directory containing raw read files |
+| `--taxonomy-file FILE` | Path to taxonomy file (Excel .xlsx or .csv) |
+| `--taxonomy-sheet SHEET` | Sheet name within taxonomy file |
+| `--skip_phylogeny [true\|false]` | Override skip_phylogeny behavior |
+| `--ref-fasta FILE` | Reference FASTA for mapping/indexing |
+| `--outdir DIR` | Override output directory |
+| `-h`, `--help` | Show this help message and exit |
 
 ---
 
@@ -211,6 +205,24 @@ results/
 
 ---
 
+## 🛠️ Troubleshooting
+
+### Common Issues
+
+**"Could not find conda environment" error:**
+```bash
+# Run the setup script to create all environments
+./scripts/setup_environments.sh
+```
+**Environment activation issues:**
+The pipeline includes robust environment checking that handles various conda configurations. If you still encounter issues, try recreating the problematic environment:
+```bash
+conda env remove -n ssuitslsu-[environment-name]
+conda env create -f envs/[environment-name].yaml
+```
+
+---
+
 ## 📄 License
 
 This pipeline is released under the **MIT License**. See [LICENSE](LICENSE) for details.
@@ -221,3 +233,5 @@ This pipeline is released under the **MIT License**. See [LICENSE](LICENSE) for 
 
 Please open an issue on GitHub if you run into any problems or have feature requests:
 [https://github.com/AleTatti/ssuitslsu-pipeline/issues](https://github.com/AleTatti/ssuitslsu-pipeline/issues)
+
+

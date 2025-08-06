@@ -55,13 +55,29 @@ check_dependencies() {
 # Verify conda environment exists before activation
 activate_env() {
     local env_name="$1"
-    if conda env list | grep -q "^${env_name} "; then
+    local env_found=false
+
+    # Method 1: Try conda info --envs (more robust, less likely to cause broken pipe)
+    if conda info --envs 2>/dev/null | grep -q "^${env_name} \|^${env_name}$\| ${env_name} \| ${env_name}$"; then
+        env_found=true
+    # Method 2: Try conda env list with limited output to avoid broken pipe
+    elif conda env list 2>/dev/null | head -n 200 | grep -q "^${env_name} "; then
+        env_found=true
+    # Method 3: Try to directly check if the environment directory exists
+    elif [[ -d "${CONDA_PREFIX}/envs/${env_name}" ]] || [[ -d "${HOME}/.conda/envs/${env_name}" ]]; then
+        env_found=true
+    fi
+
+    if [[ "$env_found" == "true" ]]; then
         set +u
         conda activate "$env_name"
         set -u
     else
         echo "ERROR: Conda environment '$env_name' not found." >&2
-        echo "Please run: conda env create -f envs/$(echo "$env_name" | sed 's/ssuitslsu-//')yaml" >&2
+        echo "Please run: conda env create -f envs/$(echo "$env_name" | sed 's/ssuitslsu-//').yaml" >&2
+        echo "" >&2
+        echo "Available conda environments:" >&2
+        conda info --envs 2>/dev/null | head -n 20 || echo "  (unable to list environments)" >&2
         exit 1
     fi
 }
@@ -872,7 +888,7 @@ for fp in "$READS_DIR"/*; do
       set +u
       CONDA_BASE=$(conda info --base)
       source "$CONDA_BASE/etc/profile.d/conda.sh"
-      conda activate ssuitslsu-minimap
+      conda activate ssuitslsu-mapping
       set -u
 
       PYTHON_EXE="${CONDA_PREFIX}/bin/python"
@@ -1980,9 +1996,7 @@ PYCODE
       # ─── Chimera Detection via Sliding p-distance ────────────────────────────────
       echo "[`date`] Starting chimera detection for $sample..."
       t_chimera_start=$(date +%s)
-      set +u
-      conda activate ssuitslsu-chimera
-      set -u
+      activate_env ssuitslsu-chimera
       PYTHON_EXE="$CONDA_PREFIX/bin/python"
 
       export CHIMERA_DIR="${SAMPLE_DIR}/chimera"

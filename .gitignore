@@ -11,8 +11,14 @@
 bamUtil/
 libStatGen/
 
-# Ignore all legacy run_pipeline scripts
-scripts/run_pipeline*.sh
+# Ignore legacy and temporary scripts (but keep main run_pipeline.sh)
+scripts/run_pipeline_*.sh
+scripts/run_pipeline*copia*.sh
+scripts/*copia*.py
+scripts/*.tmp*
+scripts/*.backup
+scripts/*.patch
+scripts/__pycache__/
 scripts/plain_pipe_slurm.sh
 scripts/run_slurm_all_samples.sh
 scripts/submit_jobs.sh
