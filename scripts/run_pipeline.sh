@@ -356,7 +356,7 @@ Usage: $(basename "$0") [OPTIONS]
 
 Options:
   -n, --no-trim             Skip fastp trimming
-  -m, --max-memory MB       Override memory (GB) for SPAdes
+  -m, --max-memory GB       Override memory (GB) for SPAdes/MEGAHIT
   -t, --threads N           Override number of threads for all steps
       --assembler [spades|megahit]
                             Choose assembler (spades or megahit)
@@ -852,9 +852,7 @@ for fp in "$READS_DIR"/*; do
       else
         # only run fastp if trimmed outputs do *not* exist
         if [[ ! -f "$out_fw" ]] || [[ ! -f "$out_rev" ]]; then
-          set +u
-          conda activate ssuitslsu-fastp
-          set -u
+          activate_env ssuitslsu-fastp
           echo "[`date`] Trimming reads for $sample with fastp"
           fastp \
             -i "$R1" -I "$R2" \
@@ -1358,9 +1356,7 @@ PYCODE
         CONTIG="$SP_DIR/contigs.fasta"
 
         if [[ ! -s "$CONTIG" ]]; then
-          set +u
-          conda activate ssuitslsu-spades
-          set -u
+          activate_env ssuitslsu-spades
           echo "[`date`] Assembling with SPAdes"
 
           # 1) clear any old run
@@ -1439,9 +1435,7 @@ PYCODE
         CONTIG="$MH_DIR/final.contigs.fa"
 
         if [[ ! -s "$CONTIG" ]]; then
-          set +u
-          conda activate ssuitslsu-megahit
-          set -u
+          activate_env ssuitslsu-megahit
           echo "[`date`] Assembling with MEGAHIT"
 
           # — delete U0 if it contains no FASTQ records
@@ -1459,13 +1453,15 @@ PYCODE
           rm -rf "$MH_DIR"
 
           # build and run Megahit
+          # Convert memory from GB to bytes (MEGAHIT expects bytes)
+          MEM_BYTES=$((MEM * 1024 * 1024 * 1024))
           cmd=(megahit \
             -1 "$P1" \
             -2 "$P2" \
             --out-dir "$MH_DIR" \
             --num-cpu-threads "$THREADS" \
             --min-contig-len 400 \
-            --memory "$MEM" \
+            --memory "$MEM_BYTES" \
             --verbose \
             --keep-tmp-files
           )
@@ -1504,9 +1500,7 @@ PYCODE
         echo "[$(date)] Skipping assembly stats (found): $ASSEMBLY_STATS"
       else
         echo "[$(date)] Computing assembly stats (contigs ≥ ${STATS_MINLEN} bp)"
-        set +u
-        conda activate ssuitslsu-itsx
-        set -u
+        activate_env ssuitslsu-itsx
 
         # 1) extract contigs ≥1 kb
         seqkit seq -m${STATS_MINLEN} "$CONTIG" -o "$FILTERED_CONTIGS"
@@ -1528,9 +1522,7 @@ PYCODE
           GC_PCT=$(  echo "$stats_data" | cut -f18 | tr -d '%')
 
           # 4) compute mean coverage across the SSU+ITS+LSU reference(s)
-          set +u
-          conda activate ssuitslsu-mapping
-          set -u
+          activate_env ssuitslsu-mapping
           mean_45S_cov=$(samtools depth -a "$BAM" \
                            | awk '{sum+=$3; cnt++} END{ if(cnt) printf("%.1f", sum/cnt); else print "0.0" }')
 
@@ -1571,9 +1563,7 @@ PYCODE
         echo "[`date`] Skipping ITSx on $sample (already completed both small & large runs)"
       else
         echo "[`date`] Preparing input for ITSx on $sample"
-        set +u
-        conda activate ssuitslsu-itsx
-        set -u
+        activate_env ssuitslsu-itsx
 
         # split contigs by length
         SMALL_FASTA="$ITSX_DIR/${sample}.small.fasta"
@@ -1707,9 +1697,7 @@ PYCODE
 
         if [[ "$FULL_ITS_COUNT" -eq 0 ]]; then
           echo "[$(date)] No full ITS sequences found, attempting ITS concatenation fallback..."
-          set +u
-          conda activate ssuitslsu-utils  # Environment with BioPython
-          set -u
+          activate_env ssuitslsu-utils  # Environment with BioPython
 
           python3 "$(dirname "$0")/its_concatenation_fallback.py" "$ITSX_DIR" "$sample" "$CONCATENATED_ITS_FASTA"
 
@@ -1914,7 +1902,7 @@ PYCODE
       if [[ ! -s "$PHYLO_ALN" ]] || [[ "$PHYLO_FASTA" -nt "$PHYLO_ALN" ]]; then
         # either no alignment yet, or the FASTA changed—rebuild it
         t_align_start=$(date +%s)
-        set +u; conda activate ssuitslsu-mafft; set -u
+        activate_env ssuitslsu-mafft
         printf "[%s] Running MAFFT → %s\n" "$(date)" "$PHYLO_ALN"
         mafft --thread "$THREADS" --auto --adjustdirection "$PHYLO_FASTA" > "$PHYLO_ALN"
         t_align_end=$(date +%s)
@@ -1930,10 +1918,7 @@ PYCODE
         echo "[$(date)] Trimming alignment → $trimmed_aln"
         # 6b) Trimming the alignment
         echo "Trimming the alignment..."
-        source "$(conda info --base)/etc/profile.d/conda.sh"
-        set +u
-        conda activate ssuitslsu-chimera
-        set -u
+        activate_env ssuitslsu-chimera
         PYTHON_EXE="$CONDA_PREFIX/bin/python"
         trimmed_aln="${PHYLO_ALN%.aln}.trimmed.aln"
         export trimmed_aln="${PHYLO_ALN%.aln}.trimmed.aln"
@@ -1977,7 +1962,7 @@ PYCODE
           printf "[%s] Skipping IQ-TREE (tree exists): %s\n\n" "$(date)" "$TREEFILE"
         else
           t_phylo_start=$(date +%s)
-          set +u; conda activate ssuitslsu-iqtree; set -u
+          activate_env ssuitslsu-iqtree
           printf "[%s] Running IQ-TREE → prefix %s\n" "$(date)" "$PHYLO_PREFIX"
           iqtree \
             -s "$TRIMMED_ALN" \
